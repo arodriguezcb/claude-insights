@@ -32,33 +32,40 @@ curl -fsSL https://raw.githubusercontent.com/Feloguarin/claude-insight/main/inst
 git clone https://github.com/Feloguarin/claude-insight.git
 cd claude-insight
 
-# Install dependencies
-pip install -r requirements.txt
+# Install the package (pure standard library — no dependencies)
+pip install -e .
 
-# Run analysis
-python -m claude_insight analyze ~/.claude/projects/
+# Run analysis on your default Claude Code transcripts
+python -m claude_insight
 ```
+
+> Requires Python 3.9+.
 
 ## 🎯 Usage
 
-### Analyze All Sessions
+Once installed, run via the `claude-insight` console script or `python -m claude_insight`.
+
+### Analyze All Sessions (default paths)
+Scans `~/.claude/projects` and `~/.claude/sessions`:
 ```bash
-python -m claude_insight analyze ~/.claude/projects/
+claude-insight
 ```
 
-### Analyze Specific Session
+### Analyze a Specific Directory or Session File
 ```bash
-python -m claude_insight analyze ~/.claude/projects/session_abc123.jsonl
+claude-insight --dir ~/.claude/projects/
+claude-insight --dir ~/.claude/projects/session_abc123.jsonl
 ```
 
-### Generate HTML Report
+### Generate an HTML Report
 ```bash
-python -m claude_insight report ~/.claude/projects/ --output report.html
+claude-insight --dir ~/.claude/projects/ --report report.html
 ```
 
-### View Raw Metrics (JSON)
+### Try It Without Real Data
+Generate and analyze mock sessions:
 ```bash
-python -m claude_insight metrics ~/.claude/projects/ --json
+claude-insight --mock
 ```
 
 ## 📊 Example Output
