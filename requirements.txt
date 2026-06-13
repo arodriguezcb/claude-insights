@@ -1,0 +1,10 @@
+# claude-insight
+# Private, local AI coding session analyzer
+# No network calls, no telemetry, no external dependencies beyond these:
+
+# Core (stdlib only, but these make it better)
+# No external requirements needed for basic functionality
+# Everything runs with Python 3.8+ standard library
+
+# Optional enhancements (install if you want prettier reports)
+# rich>=13.0.0        # For beautiful terminal output
