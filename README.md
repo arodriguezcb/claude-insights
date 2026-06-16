@@ -221,6 +221,4 @@ python -m unittest discover -s tests
 
 MIT License — see [LICENSE](LICENSE) file.
 
-## 🙏 Acknowledgments
 
-Inspired by Y Combinator's Paxel, but built for privacy-conscious developers who want their data to stay local.
