@@ -334,6 +334,251 @@ def _mcp_server(raw):
     return server
 
 
+def _mcp_plugin(raw):
+    """mcp__plugin_<plugin>_<server>__<tool> -> <plugin> (the marketplace plugin id token).
+
+    mcp__plugin_sre_jaeger-qa__find-traces   -> sre
+    mcp__plugin_engram_engram__mem_save      -> engram
+
+    Returns None for non-plugin MCP names (e.g. mcp__context7__…) and non-MCP names — only
+    plugin-provided servers carry a plugin token. Same ceiling as _mcp_server: the plugin
+    name is assumed to be a single, '_'-free token."""
+    if not raw.startswith("mcp__"):
+        return None
+    parts = raw.split("__")
+    if len(parts) < 2 or not parts[1].startswith("plugin_"):
+        return None
+    rest = parts[1][len("plugin_"):]              # 3.8-safe slice
+    return rest.split("_", 1)[0] if rest else None
+
+
+# --------------------------------------------------------------------------- #
+# Crabi-tool adoption — offline provenance join + tiny signature map
+# --------------------------------------------------------------------------- #
+#
+# Adoption is read LIVE and OFFLINE from ~/.claude config (no network, no bundled
+# plugin catalog). The two-file join — installed_plugins.json + known_marketplaces.json
+# — deterministically proves which plugins came from crabi/ai-marketplace; the signature
+# map below is needed ONLY for non-plugin / display signals (Finding 4). All of this is
+# additive post-parse: parse(), the scored corpus, and every score stay untouched.
+
+def _read_json(path):
+    """Load a JSON file; return {} on any missing/malformed/IO error — never raise."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _load_installed_plugins(claude_dir=None):
+    """{plugin_id -> first install record dict} from plugins/installed_plugins.json.
+
+    Top-level shape is {"version", "plugins"}; plugins[id] is a LIST of install records,
+    so we index [0] (the install record). Returns {} on anything malformed."""
+    root = os.path.expanduser(claude_dir or "~/.claude")
+    raw = _read_json(os.path.join(root, "plugins", "installed_plugins.json"))
+    plugins = raw.get("plugins")
+    if not isinstance(plugins, dict):
+        return {}
+    out = {}
+    for pid, records in plugins.items():
+        if isinstance(records, list) and records and isinstance(records[0], dict):
+            out[pid] = records[0]
+    return out
+
+
+def _load_known_marketplaces(claude_dir=None):
+    """{marketplace_name -> entry dict} from plugins/known_marketplaces.json (keyed by NAME)."""
+    root = os.path.expanduser(claude_dir or "~/.claude")
+    raw = _read_json(os.path.join(root, "plugins", "known_marketplaces.json"))
+    return {k: v for k, v in raw.items() if isinstance(v, dict)}
+
+
+def _load_enabled_plugins(claude_dir=None):
+    """{plugin_id -> bool} from settings.json -> enabledPlugins. {} if absent/malformed."""
+    root = os.path.expanduser(claude_dir or "~/.claude")
+    raw = _read_json(os.path.join(root, "settings.json"))
+    enabled = raw.get("enabledPlugins")
+    return enabled if isinstance(enabled, dict) else {}
+
+
+# Tiny signature map — NON-PLUGIN / DISPLAY ONLY (Finding 4). Plugin provenance is read
+# live from config, so the crabi/ai-marketplace target needs NO entry here. Each named
+# target's USED rules are the only thing that can rot, so keep this small.
+#   * mcp_tool_regex  — engram's tools land in tool_usage as bare mem_* (Finding 5).
+#   * namespace       — skills/commands surface as "<ns>:<name>" and "/<ns>:<name>"; a single
+#                       namespace token covers ponytail / obsidian / desplega usage.
+# No hook-banner parsing (Decision: speculative without Superpowers installed — Appendix).
+SIGNATURES = {
+    "engram": {
+        "plugin_id": "engram@engram",
+        # mem_* tools already land in tool_usage; counting both tool_usage AND
+        # mcp_servers["engram"] would double-count, so engram USED rides on the regex alone.
+        "mcp_tool_regex": re.compile(r"^mem_[a-z_]+$"),
+    },
+    "ponytail": {
+        "plugin_id": "ponytail@ponytail",
+        "namespace": "ponytail",
+    },
+    "obsidian": {
+        "plugin_id": "obsidian@obsidian-skills",
+        "namespace": "obsidian",
+        # The crabi-obsidian-notes skill drives Obsidian through the CLI (`obsidian vault=…`),
+        # not `/obsidian:` slash-commands — so count the Bash CLI form too, else real usage
+        # reads as used=0 (Finding: false "installed but never used" nudge). ponytail: matches
+        # the skill's mandatory `obsidian vault=` form; a bare `obsidian <subcmd>` won't count.
+        "cmd_regex": re.compile(r"\bobsidian vault="),
+    },
+    "desplega": {
+        "plugin_id": "desplega@desplega-ai-toolbox",
+        "namespace": "desplega",
+    },
+}
+
+# The provenance key: a plugin is "Crabi-authored" iff its marketplace resolves to this repo.
+CRABI_REPO = "crabi/ai-marketplace"
+
+# Display names + category for the usage panel's MCP-server grouping (display only; rot-safe
+# because an unmapped server just falls back to its raw id).
+SERVER_DISPLAY = {
+    "engram": ("Engram", "Memory"),
+    "ponytail": ("Ponytail", "Code-quality"),
+    "grafana-prod": ("Grafana (Prod)", "Observability"),
+    "grafana-qa": ("Grafana (QA)", "Observability"),
+    "jaeger-prod": ("Jaeger (Prod)", "Tracing"),
+    "jaeger-qa": ("Jaeger (QA)", "Tracing"),
+    "context7": ("Context7", "Docs"),
+    "github": ("GitHub", "VCS"),
+}
+
+
+def _namespace_used(corpus, namespace):
+    """How many times a "<ns>:" skill/command was invoked, via corpus.commands.
+
+    Commands surface as "/<ns>:<name>" (e.g. "/desplega:research"); we also accept a bare
+    "<ns>:" prefix for robustness. Skills don't reach the timeline, so commands is the
+    practical USED source for namespace tools (Finding 4)."""
+    n = 0
+    pref_cmd = "/" + namespace + ":"
+    pref_bare = namespace + ":"
+    for cmd, count in corpus.commands.items():
+        if cmd.startswith(pref_cmd) or cmd.startswith(pref_bare):
+            n += count
+    return n
+
+
+def _cmd_used(corpus, regex):
+    """How many Bash commands in the timeline matched `regex`.
+
+    The USED signal for tools driven through a CLI rather than slash-commands or MCP
+    calls — e.g. the crabi-obsidian-notes skill shells out `obsidian vault=… create …`,
+    which lands in the timeline as a bash event's `cmd`, invisible to namespace matching."""
+    n = 0
+    for _sid, _project, timeline in _iter_sessions(corpus):
+        for ev in timeline:
+            if ev.get("name") == "bash" and regex.search(ev.get("cmd") or ""):
+                n += 1
+    return n
+
+
+def _plugin_used(corpus, plugin):
+    """Total invocations of a marketplace plugin across ALL channels: slash-commands
+    (`/<plugin>:`), MCP calls (`mcp__plugin_<plugin>_…`), and Skill/Agent "<plugin>:…" ids.
+
+    A namespace-only count lies for plugins driven by MCP (sre → grafana/jaeger) or
+    subagents (breaking-balls-reviewer) — they'd read as never-used. ponytail: coarse union;
+    a slash-command that also fires a Skill event may double-count, fine for a used/never
+    signal."""
+    used = _namespace_used(corpus, plugin)
+    used += corpus.mcp_plugins.get(plugin, 0)
+    pref = plugin + ":"
+    for sk, n in corpus.skill_invocations.items():
+        if sk.startswith(pref):
+            used += n
+    return used
+
+
+def _marketplace_repo(marketplaces, name):
+    """known_marketplaces[name].source.repo, or None if any link is missing/malformed."""
+    entry = marketplaces.get(name)
+    if not isinstance(entry, dict):
+        return None
+    source = entry.get("source")
+    if not isinstance(source, dict):
+        return None
+    return source.get("repo")
+
+
+def build_adoption(corpus, claude_dir=None):
+    """Per-target {installed, enabled, used} from the offline provenance join + signatures.
+
+    Targets:
+      * "crabi/ai-marketplace" — installed iff ANY installed plugin's marketplace resolves
+        (via known_marketplaces) to CRABI_REPO; enabled iff any such plugin is enabled; used
+        = invocations of those plugins' commands (namespace = plugin name). Pure provenance —
+        no signature needed (Finding 4).
+      * named tools (engram / ponytail / obsidian / desplega) — installed iff their plugin_id
+        is in installed_plugins; used per their signature rules.
+
+    Pure post-parse + config read; raises on nothing (config readers return {} on failure).
+    """
+    installed = _load_installed_plugins(claude_dir)
+    marketplaces = _load_known_marketplaces(claude_dir)
+    enabled = _load_enabled_plugins(claude_dir)
+
+    out = {}
+
+    # --- crabi/ai-marketplace via provenance join -------------------------------------
+    crabi_ids = []
+    for pid in installed:
+        # plugin_id is "<plugin>@<marketplace>"; rsplit is 3.8-safe.
+        if "@" not in pid:
+            continue
+        _plugin, marketplace = pid.rsplit("@", 1)
+        if _marketplace_repo(marketplaces, marketplace) == CRABI_REPO:
+            crabi_ids.append(pid)
+    crabi_used = 0
+    breakdown = []
+    for pid in sorted(crabi_ids):
+        plugin_name = pid.rsplit("@", 1)[0]
+        u = _plugin_used(corpus, plugin_name)
+        crabi_used += u
+        breakdown.append({"name": plugin_name, "used": u, "enabled": bool(enabled.get(pid))})
+    out[CRABI_REPO] = {
+        "installed": bool(crabi_ids),
+        "enabled": (any(enabled.get(pid) for pid in crabi_ids) if crabi_ids else None),
+        "used": crabi_used,
+        "plugins": sorted(p.rsplit("@", 1)[0] for p in crabi_ids),
+        "plugin_breakdown": breakdown,   # per-plugin used / never-used (multi-channel)
+    }
+
+    # --- named tools via signature map ------------------------------------------------
+    for target, sig in SIGNATURES.items():
+        pid = sig["plugin_id"]
+        is_installed = pid in installed
+        used = 0
+        rx = sig.get("mcp_tool_regex")
+        if rx is not None:
+            for tool, count in corpus.tool_usage.items():
+                if rx.match(tool):
+                    used += count
+        ns = sig.get("namespace")
+        if ns:
+            used += _namespace_used(corpus, ns)
+        cmd_rx = sig.get("cmd_regex")
+        if cmd_rx is not None:
+            used += _cmd_used(corpus, cmd_rx)
+        out[target] = {
+            "installed": is_installed,
+            "enabled": (bool(enabled.get(pid)) if is_installed else None),
+            "used": used,
+        }
+
+    return out
+
+
 # Redact machine-identifying home paths from free text before it is shown in the report or
 # written to the evidence bundle. Applied only at PRESENTATION, never to the scored corpus,
 # so scores stay byte-identical.
@@ -362,7 +607,9 @@ class Corpus:
         self.real_prompts = []          # list of dicts: text, project, session, idx
         self.tool_usage = Counter()     # de-namespaced tool name -> count
         self.mcp_servers = Counter()    # mcp server-id (plugin infix stripped) -> call count
+        self.mcp_plugins = Counter()    # mcp plugin token (mcp__plugin_<plugin>_…) -> call count
         self.commands = Counter()       # slash-command name -> count
+        self.skill_invocations = Counter()  # Skill/Agent "<ns>:<name>" -> count
         self.total_tool_calls = 0
         self.delegation_events = 0
         self.first_ts = None
@@ -516,10 +763,18 @@ def parse(files):
                                 srv = _mcp_server(raw)
                                 if srv:
                                     c.mcp_servers[srv] += 1
+                                plg = _mcp_plugin(raw)
+                                if plg:
+                                    c.mcp_plugins[plg] += 1
                                 name = _denamespace_tool(raw)
                                 c.tool_usage[name] += 1
                                 c.total_tool_calls += 1
                                 inp = b.get("input", {}) if isinstance(b.get("input"), dict) else {}
+                                # Skill tool / Agent subagent_type carry a "<ns>:<name>" id — the
+                                # USED signal for plugins driven via skills/subagents, not slash-commands.
+                                sk = inp.get("skill") or inp.get("subagent_type")
+                                if isinstance(sk, str) and sk:
+                                    c.skill_invocations[sk] += 1
                                 if name.lower() in DELEGATION_TOOLS:
                                     c.delegation_events += 1
                                 if name.lower() == "bash" and inp.get("run_in_background"):
@@ -528,7 +783,7 @@ def parse(files):
                                 cmd = inp.get("command") if name.lower() == "bash" else None
                                 timeline.append({
                                     "kind": "tool", "name": name.lower(),
-                                    "file": fpath, "cmd": cmd,
+                                    "file": fpath, "cmd": cmd, "server": srv,
                                 })
                     continue
 
@@ -653,28 +908,38 @@ def _iter_sessions(corpus):
 
 # Planning skills/commands surface in a timeline event's `name` as one of these tokens.
 _PLAN_NAME_RE = re.compile(r"plan|research|brainstorm", re.I)
+# Tools that spawn other agents — the "Delegate" work-type (a subset of DELEGATION_TOOLS:
+# the plan-mode toggles aren't delegation work).
+_DELEGATE_WORK = {"agent", "task", "workflow"}
+
+WORK_TYPE_BUCKETS = ["Build", "Debug", "Plan", "Investigate", "Shell/Ops", "Delegate", "Other"]
 
 
 def classify_work_types(corpus):
-    """Coarse Build/Debug/Plan/Other mix over every timeline event.
+    """Work-type mix over every timeline TOOL event (prompts excluded — this measures
+    actions, not chat).
 
     Pure post-parse: reads only `corpus.sessions[*]["timeline"]`, touches nothing scored.
-    Each event lands in exactly one bucket, by already-present signals:
-      * Build  — tool event whose `name` is an edit tool (EDIT_TOOLS).
-      * Debug  — tool event whose `cmd` matches VERIFY_RE (test/build/run invocations).
-      * Plan   — event `name` reads as a planning skill/command (plan/research/brainstorm),
-                 plus plan-ish slash-command invocations from `corpus.commands` (see below).
-      * Other  — everything else (reads, prompts, misc tools).
+    Each tool event lands in exactly one bucket, by already-present signals:
+      * Build       — `name` is an edit tool (EDIT_TOOLS).
+      * Debug       — `cmd` matches VERIFY_RE (test/build/run invocations).
+      * Plan        — `name` reads as a planning skill/command (plan/research/brainstorm),
+                      plus plan-ish slash-command invocations from `corpus.commands`.
+      * Investigate — an MCP call (event has a `server`) or a read tool (READ_TOOLS):
+                      observability queries + code reading.
+      * Shell/Ops   — a Bash command that wasn't a Debug/verify run (git, file ops, …).
+      * Delegate    — spawns a sub-agent/workflow (_DELEGATE_WORK).
+      * Other        — everything else (web fetch/search, task mgmt, misc tooling).
 
     Returns {"counts": {bucket: int}, "pct": {bucket: float}}; pct is over all classified
-    events and sums to ~100 (± rounding). Ponytail ceiling: this is a coarse per-event
-    heuristic; when an event matches more than one signal, precedence is Build > Debug >
-    Plan > Other.
+    events and sums to ~100 (± rounding). Ponytail ceiling: coarse per-event heuristic;
+    when an event matches more than one signal, precedence is the bucket order above.
     """
-    buckets = ["Build", "Debug", "Plan", "Other"]
-    counts = {b: 0 for b in buckets}
+    counts = {b: 0 for b in WORK_TYPE_BUCKETS}
     for _sid, _project, timeline in _iter_sessions(corpus):
         for ev in timeline:
+            if ev.get("kind") != "tool":          # work-type is about actions, not prompts
+                continue
             name = (ev.get("name") or "")
             cmd = ev.get("cmd") or ""
             if name in EDIT_TOOLS:
@@ -683,6 +948,12 @@ def classify_work_types(corpus):
                 counts["Debug"] += 1
             elif _PLAN_NAME_RE.search(name):
                 counts["Plan"] += 1
+            elif ev.get("server") or name in READ_TOOLS:
+                counts["Investigate"] += 1
+            elif name in _DELEGATE_WORK:
+                counts["Delegate"] += 1
+            elif name == "bash":
+                counts["Shell/Ops"] += 1
             else:
                 counts["Other"] += 1
     # Planning runs through slash commands (counted in corpus.commands), which never reach the
@@ -692,7 +963,7 @@ def classify_work_types(corpus):
         if _PLAN_NAME_RE.search(cmd):
             counts["Plan"] += n
     total = sum(counts.values())
-    pct = {b: (100.0 * counts[b] / total if total else 0.0) for b in buckets}
+    pct = {b: (100.0 * counts[b] / total if total else 0.0) for b in WORK_TYPE_BUCKETS}
     return {"counts": counts, "pct": pct}
 
 
@@ -1040,6 +1311,15 @@ def build_evidence(corpus, result, cards, archive_info=None):
             "weak_examples": {c["dim"]: clean_ex(c["weak"]) for c in cards},
             "tool_usage": dict(corpus.tool_usage),
             "delegation_events": corpus.delegation_events,
+            # Additive, descriptive usage/adoption views — outside run_fingerprint (which
+            # hashes only real_prompts), so they never affect the merge-gate. The coaching
+            # nudge in .claude/workflows/ai-fluency.js reads behavior.adoption from here.
+            "usage": {
+                "mcp_servers": dict(corpus.mcp_servers),
+                "commands": dict(corpus.commands),
+                "work_types": classify_work_types(corpus),
+            },
+            "adoption": build_adoption(corpus),
         },
     }
 
@@ -1077,6 +1357,128 @@ def _analysis_section_html(analysis):
                  'This section is written by Claude Opus 4.8 from your de-contaminated evidence '
                  '(explored by Claude Sonnet 4.6), grounded in the bundled AI Fluency framework. '
                  'The numbers above are computed deterministically and independently.</p>')
+    parts.append('</section>')
+    return "".join(parts)
+
+
+def _server_display(server):
+    """(display-name, category) for an mcp server-id; falls back to the raw id / '—'."""
+    name, cat = SERVER_DISPLAY.get(server, (server, "—"))
+    return name, cat
+
+
+# Friendly labels for the adoption targets (the crabi marketplace key is a repo slug).
+_ADOPTION_LABEL = {
+    CRABI_REPO: "Crabi marketplace",
+    "engram": "Engram (memory)",
+    "ponytail": "Ponytail (code-quality)",
+    "obsidian": "Obsidian (notes)",
+    "desplega": "Desplega (toolbox)",
+}
+
+
+def _usage_section_html(usage, adoption, span_days):
+    """One combined 'Usage & Adoption' section, mirroring _analysis_section_html.
+
+    Renders four blocks over the REAL measured window (span_days, an honest count):
+      * MCP calls grouped by server (display names from SERVER_DISPLAY),
+      * top slash commands by count,
+      * the Build/Debug/Plan/Other work-type mix as bars,
+      * per-target installed/enabled/used adoption badges, visually emphasizing the
+        installed-but-never-used case (the strongest coaching signal).
+    All dynamic text is escaped via _esc. Returns '' only on a fully empty payload."""
+    if not usage and not adoption:
+        return ""
+    usage = usage or {}
+    span = f"over the last {span_days} days" if span_days else "over your history"
+
+    parts = ['<section><h3>Usage &amp; Crabi-tool adoption</h3>']
+
+    # --- MCP calls by server --------------------------------------------------------
+    servers = (usage.get("mcp_servers") or Counter())
+    if servers:
+        rows = ""
+        for server, n in servers.most_common(12):
+            name, cat = _server_display(server)
+            rows += (f'<div class="bar-item"><div class="bl">{_esc(name)} '
+                     f'<span class="loc">{_esc(cat)}</span></div>'
+                     f'<div class="bt"><i style="width:100%"></i></div>'
+                     f'<div class="bv">{n:,}</div></div>')
+        parts.append(f'<p class="def">MCP-server calls {_esc(span)}:</p>{rows}')
+    else:
+        parts.append(f'<p class="rate">No MCP-server calls {_esc(span)}.</p>')
+
+    # --- Slash commands -------------------------------------------------------------
+    commands = (usage.get("commands") or Counter())
+    if commands:
+        items = "".join(
+            f"<li><b>{n:,}</b> {_esc(cmd)}</li>" for cmd, n in commands.most_common(10)
+        )
+        parts.append('<p class="def" style="margin-top:14px">Top slash commands '
+                     f'{_esc(span)}:</p><ul class="facts">{items}</ul>')
+
+    # --- Work-type mix --------------------------------------------------------------
+    wt = usage.get("work_types") or {}
+    pct = wt.get("pct") or {}
+    if pct:
+        bars = ""
+        for bucket in WORK_TYPE_BUCKETS:
+            p = pct.get(bucket, 0.0)
+            bars += (f'<div class="bar-item"><div class="bl">{_esc(bucket)}</div>'
+                     f'<div class="bt"><i style="width:{p:.0f}%"></i></div>'
+                     f'<div class="bv">{p:.0f}%</div></div>')
+        parts.append(f'<p class="def" style="margin-top:14px">Work-type mix {_esc(span)}:</p>{bars}')
+
+    # --- Adoption -------------------------------------------------------------------
+    if adoption:
+        parts.append('<p class="def" style="margin-top:14px">Crabi-tool adoption:</p>')
+        for target, state in adoption.items():
+            if not isinstance(state, dict):
+                continue
+            label = _ADOPTION_LABEL.get(target, target)
+            installed = state.get("installed")
+            enabled = state.get("enabled")
+            used = state.get("used", 0)
+            badges = []
+            badges.append('<span class="tag s">installed</span>' if installed
+                          else '<span class="tag ld">not installed</span>')
+            if installed:
+                if enabled is True:
+                    badges.append('<span class="tag s">enabled</span>')
+                elif enabled is False:
+                    badges.append('<span class="tag w">disabled</span>')
+            # The coaching signal: installed but never invoked.
+            if installed and not used:
+                badges.append('<span class="tag w">never used</span>')
+            else:
+                badges.append(f'<span class="tag ld">used {used:,}×</span>')
+            unused = installed and not used
+            row_cls = ' style="border-left:4px solid var(--warn)"' if unused else ""
+            # Per-plugin breakdown for the marketplace target: which plugins are used vs idle.
+            bd = state.get("plugin_breakdown") or []
+            bd_html = ""
+            if bd:
+                used_p = sorted((p for p in bd if p.get("used")), key=lambda x: -x["used"])
+                idle_p = [p for p in bd if not p.get("used")]
+                if used_p:
+                    chips = " ".join(f'<span class="tag s">{_esc(p["name"])} {p["used"]:,}×</span>'
+                                     for p in used_p)
+                    bd_html += f'<p class="rate">Used: {chips}</p>'
+                if idle_p:
+                    chips = " ".join(f'<span class="tag w">{_esc(p["name"])}</span>' for p in idle_p)
+                    bd_html += (f'<p class="rate">Never used ({len(idle_p)} of {len(bd)}): '
+                                f'{chips} — installed but idle.</p>')
+            parts.append(
+                f'<div class="dim"{row_cls}><div class="top">'
+                f'<span class="name">{_esc(label)} {"".join(badges)}</span></div>'
+                + ('<p class="rate">Installed but never used — a tool you could lean on.</p>'
+                   if unused else "")
+                + bd_html
+                + '</div>')
+
+    parts.append('<p style="color:var(--mut);font-size:13px;margin-top:10px">'
+                 'Raw counts over your real measured window — not normalized. Adoption is read '
+                 'live from your local plugin config; nothing left this machine.</p>')
     parts.append('</section>')
     return "".join(parts)
 
@@ -1221,7 +1623,8 @@ def build_assessment(corpus, result, cards):
     return (f'<p class="assess">{p1}</p><p class="assess">{p2}</p><p class="assess">{p3}</p>')
 
 
-def build_html(corpus, result, cards, strength, archive_info=None, analysis=None, analysis_note=None):
+def build_html(corpus, result, cards, strength, archive_info=None, analysis=None, analysis_note=None,
+               usage=None, adoption=None):
     a = result["archetype"]
     d = result["dist"]
     analysis_section = _analysis_section_html(analysis)
@@ -1237,8 +1640,9 @@ def build_html(corpus, result, cards, strength, archive_info=None, analysis=None
             'to add the AI-written skill map, re-run <code>/ai-fluency</code> inside Claude Code.'
             '</div></section>')
     days = (corpus.last_ts - corpus.first_ts).days if corpus.first_ts and corpus.last_ts else 0
+    # Usage & adoption block: honest span label uses the same measured `days` as the data tile.
+    usage_section = _usage_section_html(usage, adoption, days)
     active_h = corpus.active_seconds / 3600
-    filtered_total = sum(corpus.filtered.values())
     provisional = len(corpus.real_prompts) < PROVISIONAL_MIN_PROMPTS
 
     DIM_BLURB = {
@@ -1293,34 +1697,11 @@ def build_html(corpus, result, cards, strength, archive_info=None, analysis=None
         aff += f"""<div class="bar-item"><div class="bl">{PROTOTYPES[nm]['emoji']} {_esc(nm)}</div>
           <div class="bt"><i style="width:{pct}%"></i></div><div class="bv">{sim:+.2f}</div></div>"""
 
-    # data-ingested filter breakdown
-    filt = "".join(
-        f"<li><b>{v:,}</b> {_esc(k)}</li>" for k, v in corpus.filtered.most_common()
-    )
-
-    # Archive stat tile + the "why ~30 days / how to see more" callout.
-    archive_tile = retention_note = ""
-    arch_dir_disp = _esc(archive_info["dir"]) if archive_info else _esc(DEFAULT_ARCHIVE_DIR)
+    # Archive stat tile (we only analyze what Claude Code keeps on disk — ~30 days).
+    archive_tile = ""
     if archive_info:
         archive_tile = (f'<div class="ing"><div class="n">{archive_info["archived_sessions"]:,}</div>'
                         f'<div class="l">sessions in your archive</div></div>')
-    # Show the explainer whenever the visible history is short — that's the 30-day cleanup biting.
-    if days <= 32:
-        grew = ""
-        if archive_info and archive_info.get("enabled"):
-            grew = (f' This run preserved <b>{archive_info["new"]:,}</b> new session(s) to your '
-                    f'archive (<code>{arch_dir_disp}</code>), so from here your history keeps growing '
-                    f'past the 30-day wall. Keep this archive private to you — sharing one folder '
-                    f'between people would mix everyone\'s transcripts into a single report.')
-        retention_note = (
-            '<div class="honesty" style="margin-top:14px">'
-            f'<b>Why only ~{days} days?</b> Claude Code deletes transcripts older than your '
-            '<code>cleanupPeriodDays</code> setting (default <b>30</b>), so that is all that was '
-            'left on disk to read — not a limit of this tool. To analyze more history: '
-            '<b>(1)</b> raise <code>cleanupPeriodDays</code> in <code>~/.claude/settings.json</code> '
-            '(e.g. <code>"cleanupPeriodDays": 365</code>) to stop the deletion; '
-            f'<b>(2)</b> keep running Claude Insight.{grew}'
-            '</div>')
 
     # action cards (what/where/how)
     def evidence_html(card):
@@ -1584,13 +1965,9 @@ code{{background:#23264a;padding:1px 6px;border-radius:5px;font-size:13px}}
     <div class="ing"><div class="n">{active_h:.0f} h</div><div class="l">hands-on active time</div></div>
     {archive_tile}
   </div>
-  {retention_note}
-  <div class="honesty">
-    <b>The honest part:</b> we found {corpus.user_records:,} “user” records but only <b>{len(corpus.real_prompts)}</b> are prompts <b>you</b> typed. We filtered out {filtered_total:,} that the old tool wrongly counted:
-    <ul>{filt}</ul>
-    <p style="color:var(--mut);font-size:13px;margin-top:10px">Your real prompts: median {d.get('median_chars','?')} chars · {d.get('under_80_pct','?')}% under 80 chars · {active_h:.0f} h hands-on active time (idle gaps over 5 min are excluded — not raw wall-clock).</p>
-  </div>
 </section>
+
+{usage_section}
 
 {analysis_section}
 {analysis_status_html}
@@ -1620,17 +1997,6 @@ code{{background:#23264a;padding:1px 6px;border-radius:5px;font-size:13px}}
 <section>
   <h3>Honest numbers at a glance</h3>
   <ul class="facts">{facts_html}</ul>
-</section>
-
-<section>
-  <h3>Methodology &amp; honesty</h3>
-  <details><summary>How every number was computed (click to expand)</summary>
-    <p><b>Only real prompts are scored.</b> A “user” record counts as a prompt only if it is not a tool-result, not a subagent (sidechain) turn, not meta/injected, not a slash-command stub, and not a paste/system-prompt over {MAX_HUMAN_PROMPT_CHARS:,} chars or opening with “You are …”. This removes the contamination that made the old tool report a {d.get('mean_chars','?')}-vs-real average.</p>
-    <p><b>Everything is a rate, then squashed.</b> Each dimension is a per-prompt or per-opportunity rate run through min(1, rate/target), so doing more work never raises the score — only doing it better does. Weights: Briefing 24%, Verification 22%, Context-setting 22%, Iteration 18%, Toolcraft 14%.</p>
-    <p><b>Thin signals are hedged, not faked.</b> Each dimension is pulled toward a neutral 50 in proportion to how many opportunities it had (e.g. Iteration had only {result['detail']['Iteration']['corrections']} corrections, so it is flagged “low data”). Both raw and confidence-adjusted scores are shown.</p>
-    <p><b>Archetype</b> describes your <b>driving style</b>, not the collaboration's quality, so it is built on a separate <b>agency-weighted</b> vector: Briefing, Iteration, Toolcraft and Delegation (handoffs to subagents/background jobs/planning) count fully, while Verification and Context — habits Claude largely does on its own — are discounted ({int(AGENCY['Verification']*100)}% and {int(AGENCY['Context']*100)}% weight). It is the nearest prototype by cosine on z-scored values; if the top two are within {ARCHETYPE_MARGIN} we show a blend. <b>Active time</b> caps idle gaps at {GAP_CAP_SECONDS//60} min. <b>Fixes vs v1:</b> prompt mis-count, length inflation, idle-time over-count, random archetype, uncapped tool-diversity, and keyword “error” false-positives.</p>
-    <p><b>Limits:</b> this measures observable behavior, not intent; detectors are heuristic and English-biased; it's a single snapshot, not a trend. Terse prompts that carry intent from the prior turn can under-score Direction.</p>
-  </details>
 </section>
 
 <footer>Generated locally by Claude Insight v2 · your transcripts never left this machine.</footer>
@@ -1829,8 +2195,17 @@ def main(argv=None):
         print(json.dumps(payload, indent=2))
         return 0
 
+    # Usage & adoption are additive, post-parse views (never touch the scored corpus).
+    usage = {
+        "mcp_servers": corpus.mcp_servers,
+        "commands": corpus.commands,
+        "work_types": classify_work_types(corpus),
+    }
+    adoption = build_adoption(corpus)
+
     # Render fully before touching the file, so a render error can't leave a 0-byte report.
-    html_doc = build_html(corpus, result, cards, strength, archive_info, analysis, analysis_note)
+    html_doc = build_html(corpus, result, cards, strength, archive_info, analysis, analysis_note,
+                          usage=usage, adoption=adoption)
     out_path = os.path.abspath(args.out)
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:

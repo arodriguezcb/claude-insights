@@ -731,30 +731,60 @@ class TestRealPromptsRegressionGuard(unittest.TestCase):
 
 
 class TestWorkTypeBuckets(unittest.TestCase):
-    """classify_work_types buckets timeline events into Build/Debug/Plan/Other proportions."""
+    """classify_work_types buckets timeline TOOL events into the 7-way work-type mix."""
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
 
     def test_work_type_buckets(self):
-        # 4 edits (Build), 3 verify-cmds (Debug), 2 plan-skills (Plan), 1 read (Other) -> 10 events.
+        # 4 edits (Build), 3 verify-cmds (Debug), 2 plan-skills (Plan), 1 read (Investigate) -> 10.
         recs = (
             [assistant_tool("Write", file_path="/a.py")] * 2
             + [assistant_tool("Edit", file_path="/b.py")] * 2
             + [assistant_tool("Bash", command="python -m pytest -q")] * 3
             + [assistant_tool("ExitPlanMode")] * 2          # name 'exitplanmode' contains 'plan'
-            + [assistant_tool("Read", file_path="/c.py")]   # Other
+            + [assistant_tool("Read", file_path="/c.py")]   # read tool -> Investigate
         )
         write_session(self.tmp, "s.jsonl", recs)
         corpus = insight.parse(insight.discover_files(self.tmp))
         mix = insight.classify_work_types(corpus)
-        self.assertEqual(mix["counts"], {"Build": 4, "Debug": 3, "Plan": 2, "Other": 1})
+        self.assertEqual(mix["counts"]["Build"], 4)
+        self.assertEqual(mix["counts"]["Debug"], 3)
+        self.assertEqual(mix["counts"]["Plan"], 2)
+        self.assertEqual(mix["counts"]["Investigate"], 1)
+        self.assertEqual(mix["counts"]["Other"], 0)
         self.assertAlmostEqual(mix["pct"]["Build"], 40.0)
-        self.assertAlmostEqual(mix["pct"]["Debug"], 30.0)
-        self.assertAlmostEqual(mix["pct"]["Plan"], 20.0)
-        self.assertAlmostEqual(mix["pct"]["Other"], 10.0)
-        # percentages sum to 100 (± rounding)
         self.assertAlmostEqual(sum(mix["pct"].values()), 100.0)
+
+    def test_work_type_investigate_shell_delegate(self):
+        # The buckets that used to vanish into "Other": MCP queries + reads -> Investigate,
+        # non-verify bash -> Shell/Ops, agent spawns -> Delegate.
+        recs = [
+            assistant_tool("mcp__plugin_sre_grafana-prod__query_prometheus"),  # MCP -> Investigate
+            assistant_tool("Grep", pattern="foo"),                            # read tool -> Investigate
+            assistant_tool("Bash", command="git status"),                     # non-verify -> Shell/Ops
+            assistant_tool("Agent", subagent_type="sre:sre-investigator"),    # spawn -> Delegate
+        ]
+        write_session(self.tmp, "s.jsonl", recs)
+        corpus = insight.parse(insight.discover_files(self.tmp))
+        mix = insight.classify_work_types(corpus)
+        self.assertEqual(mix["counts"]["Investigate"], 2)
+        self.assertEqual(mix["counts"]["Shell/Ops"], 1)
+        self.assertEqual(mix["counts"]["Delegate"], 1)
+        self.assertEqual(mix["counts"]["Other"], 0)
+
+    def test_work_type_excludes_prompts(self):
+        # Work-type measures actions, not chat: plain prompts must not land in any bucket.
+        recs = [
+            user_text("just chatting, no command"),
+            user_text("another plain message"),
+            assistant_tool("Write", file_path="/a.py"),
+        ]
+        write_session(self.tmp, "s.jsonl", recs)
+        corpus = insight.parse(insight.discover_files(self.tmp))
+        mix = insight.classify_work_types(corpus)
+        self.assertEqual(sum(mix["counts"].values()), 1)   # only the Write tool event
+        self.assertEqual(mix["counts"]["Build"], 1)
 
     def test_work_type_precedence_build_over_debug(self):
         # an edit tool that somehow also carries a verify cmd is Build, not Debug (precedence).
@@ -784,14 +814,308 @@ class TestWorkTypeBuckets(unittest.TestCase):
         mix = insight.classify_work_types(corpus)
         self.assertEqual(mix["counts"]["Plan"], 3)
         self.assertEqual(mix["counts"]["Build"], 1)
-        self.assertEqual(mix["counts"]["Other"], 1)
+        self.assertEqual(mix["counts"]["Investigate"], 1)   # the Read
         self.assertAlmostEqual(sum(mix["pct"].values()), 100.0)
 
     def test_work_type_empty_corpus(self):
         corpus = insight.Corpus()
         mix = insight.classify_work_types(corpus)
-        self.assertEqual(mix["counts"], {"Build": 0, "Debug": 0, "Plan": 0, "Other": 0})
+        self.assertEqual(set(mix["counts"]), set(insight.WORK_TYPE_BUCKETS))
+        self.assertEqual(sum(mix["counts"].values()), 0)
         self.assertEqual(sum(mix["pct"].values()), 0.0)
+
+
+def _write_claude_config(root, installed, marketplaces, enabled):
+    """Write fake ~/.claude config (installed_plugins / known_marketplaces / settings)."""
+    plugins_dir = os.path.join(root, "plugins")
+    os.makedirs(plugins_dir, exist_ok=True)
+    # installed_plugins: plugins[id] is a LIST of install records (we index [0]).
+    inst = {"version": 1, "plugins": {pid: [{"version": "1.0.0"}] for pid in installed}}
+    with open(os.path.join(plugins_dir, "installed_plugins.json"), "w", encoding="utf-8") as f:
+        json.dump(inst, f)
+    mkt = {name: {"source": {"source": "github", "repo": repo}}
+           for name, repo in marketplaces.items()}
+    with open(os.path.join(plugins_dir, "known_marketplaces.json"), "w", encoding="utf-8") as f:
+        json.dump(mkt, f)
+    with open(os.path.join(root, "settings.json"), "w", encoding="utf-8") as f:
+        json.dump({"enabledPlugins": enabled}, f)
+
+
+class TestAdoption(unittest.TestCase):
+    """build_adoption joins offline config provenance with corpus usage into the trichotomy."""
+
+    def setUp(self):
+        self.cfg = tempfile.mkdtemp()   # fake ~/.claude
+        self.tmp = tempfile.mkdtemp()   # transcript dir
+
+    def _corpus(self, recs):
+        write_session(self.tmp, "s.jsonl", recs)
+        return insight.parse(insight.discover_files(self.tmp))
+
+    def test_adoption_trichotomy(self):
+        # engram: installed + enabled + used (mem_* calls)
+        # ponytail: installed + DISABLED (used > 0, but enabled flag is False)
+        # obsidian: installed + enabled + NEVER USED (used == 0)
+        _write_claude_config(
+            self.cfg,
+            installed=["engram@engram", "ponytail@ponytail", "obsidian@obsidian-skills"],
+            marketplaces={"engram": "Gentleman-Programming/engram",
+                          "ponytail": "DietrichGebert/ponytail",
+                          "obsidian-skills": "kepano/obsidian-skills"},
+            enabled={"engram@engram": True, "obsidian@obsidian-skills": True},  # ponytail absent/False
+        )
+        corpus = self._corpus([
+            assistant_tool("mcp__plugin_engram_engram__mem_save"),
+            assistant_tool("mcp__plugin_engram_engram__mem_search"),
+            user_text("<command-name>/ponytail:ponytail-review</command-name>"),
+        ])
+        a = insight.build_adoption(corpus, claude_dir=self.cfg)
+
+        # installed + enabled + used
+        self.assertTrue(a["engram"]["installed"])
+        self.assertTrue(a["engram"]["enabled"])
+        self.assertEqual(a["engram"]["used"], 2)
+
+        # installed + disabled (used > 0 but not enabled)
+        self.assertTrue(a["ponytail"]["installed"])
+        self.assertFalse(a["ponytail"]["enabled"])
+        self.assertEqual(a["ponytail"]["used"], 1)
+
+        # installed + never used (the strongest coaching signal)
+        self.assertTrue(a["obsidian"]["installed"])
+        self.assertTrue(a["obsidian"]["enabled"])
+        self.assertEqual(a["obsidian"]["used"], 0)
+
+    def test_adoption_obsidian_cli_used(self):
+        # The crabi-obsidian-notes skill drives Obsidian via the `obsidian vault=…` CLI
+        # (a Bash command), not `/obsidian:` slash-commands. Those Bash calls must count as
+        # USED, else heavy real usage falsely reads as "installed but never used".
+        _write_claude_config(
+            self.cfg,
+            installed=["obsidian@obsidian-skills"],
+            marketplaces={"obsidian-skills": "kepano/obsidian-skills"},
+            enabled={"obsidian@obsidian-skills": True},
+        )
+        corpus = self._corpus([
+            assistant_tool("Bash", command='obsidian vault="Obsidian Vault" create path="x.md" content="y" silent'),
+            assistant_tool("Bash", command='cd "/Users/x/Obsidian Vault" && obsidian vault="Obsidian Vault" search query="z"'),
+            assistant_tool("Bash", command='cd "/Users/x/Obsidian Vault" && git commit -m "note"'),  # not the CLI
+        ])
+        a = insight.build_adoption(corpus, claude_dir=self.cfg)
+        self.assertTrue(a["obsidian"]["installed"])
+        # Two `obsidian vault=` invocations (one chained after &&) count; the `git commit`
+        # whose path contains capital-O "Obsidian Vault" must NOT false-match.
+        self.assertEqual(a["obsidian"]["used"], 2)
+
+    def test_adoption_provenance_gate(self):
+        # A plugin from a NON-crabi marketplace must NOT flag the crabi/ai-marketplace target,
+        # even if it shares a plugin base-name. Provenance is the gate, not the name.
+        _write_claude_config(
+            self.cfg,
+            installed=["sre@some-other-marketplace"],
+            marketplaces={"some-other-marketplace": "someone-else/not-crabi"},
+            enabled={"sre@some-other-marketplace": True},
+        )
+        corpus = self._corpus([user_text("<command-name>/sre:diagnose-service</command-name>")])
+        a = insight.build_adoption(corpus, claude_dir=self.cfg)
+        self.assertFalse(a["crabi/ai-marketplace"]["installed"])
+        self.assertIsNone(a["crabi/ai-marketplace"]["enabled"])
+        self.assertEqual(a["crabi/ai-marketplace"]["used"], 0)
+
+    def test_adoption_crabi_provenance_join(self):
+        # The crabi target is flagged purely by source.repo == crabi/ai-marketplace, and USED
+        # counts that plugin's slash-command invocations (namespace = plugin name).
+        _write_claude_config(
+            self.cfg,
+            installed=["sre@crabi-ai-marketplace", "qa@crabi-ai-marketplace",
+                       "desplega@desplega-ai-toolbox"],
+            marketplaces={"crabi-ai-marketplace": "crabi/ai-marketplace",
+                          "desplega-ai-toolbox": "desplega-ai/ai-toolbox"},
+            enabled={"sre@crabi-ai-marketplace": True},   # qa present but not enabled
+        )
+        corpus = self._corpus([
+            user_text("<command-name>/sre:diagnose-service</command-name>"),
+            user_text("<command-name>/sre:query-logs</command-name>"),
+            user_text("<command-name>/desplega:research</command-name>"),  # not a crabi plugin
+        ])
+        a = insight.build_adoption(corpus, claude_dir=self.cfg)
+        crabi = a["crabi/ai-marketplace"]
+        self.assertTrue(crabi["installed"])
+        self.assertTrue(crabi["enabled"])           # at least one crabi plugin enabled
+        self.assertEqual(crabi["used"], 2)          # two /sre: invocations, /desplega excluded
+        self.assertEqual(crabi["plugins"], ["qa", "sre"])
+        # desplega counts on its own target, NOT the crabi one.
+        self.assertEqual(a["desplega"]["used"], 1)
+
+    def test_adoption_crabi_plugin_breakdown(self):
+        # Per-plugin used/never-used across ALL channels: slash (/sre:), MCP (mcp__plugin_data_…),
+        # and subagent (qa:crabi-qa). 'docs' is installed but never invoked -> used 0.
+        _write_claude_config(
+            self.cfg,
+            installed=["sre@crabi-ai-marketplace", "data@crabi-ai-marketplace",
+                       "qa@crabi-ai-marketplace", "docs@crabi-ai-marketplace"],
+            marketplaces={"crabi-ai-marketplace": "crabi/ai-marketplace"},
+            enabled={"sre@crabi-ai-marketplace": True, "data@crabi-ai-marketplace": True,
+                     "qa@crabi-ai-marketplace": True, "docs@crabi-ai-marketplace": True},
+        )
+        corpus = self._corpus([
+            user_text("<command-name>/sre:query-logs</command-name>"),    # sre via slash
+            assistant_tool("mcp__plugin_data_lineage__get_table"),        # data via MCP
+            assistant_tool("mcp__plugin_data_lineage__get_table"),        # data via MCP (x2)
+            assistant_tool("Agent", subagent_type="qa:crabi-qa"),         # qa via subagent
+            # docs: never invoked
+        ])
+        a = insight.build_adoption(corpus, claude_dir=self.cfg)
+        bd = {p["name"]: p["used"] for p in a["crabi/ai-marketplace"]["plugin_breakdown"]}
+        self.assertEqual(bd["sre"], 1)    # slash channel
+        self.assertEqual(bd["data"], 2)   # MCP channel — would read 0 under namespace-only
+        self.assertEqual(bd["qa"], 1)     # subagent channel
+        self.assertEqual(bd["docs"], 0)   # installed but never used
+        self.assertEqual(a["crabi/ai-marketplace"]["used"], 4)  # aggregate is the sum
+
+    def test_adoption_missing_config_returns_empty(self):
+        # Pointed at a dir with NO config files: readers return {} and build_adoption never raises.
+        empty = tempfile.mkdtemp()
+        self.assertEqual(insight._load_installed_plugins(empty), {})
+        self.assertEqual(insight._load_known_marketplaces(empty), {})
+        self.assertEqual(insight._load_enabled_plugins(empty), {})
+        a = insight.build_adoption(insight.Corpus(), claude_dir=empty)
+        # crabi target degrades gracefully: not installed, enabled None, zero used.
+        self.assertFalse(a["crabi/ai-marketplace"]["installed"])
+        self.assertIsNone(a["crabi/ai-marketplace"]["enabled"])
+        # named targets likewise: not installed.
+        for t in ("engram", "ponytail", "obsidian", "desplega"):
+            self.assertFalse(a[t]["installed"])
+            self.assertIsNone(a[t]["enabled"])
+
+    def test_adoption_missing_handles_malformed_json(self):
+        # Malformed JSON in each config file must NOT raise — readers swallow ValueError.
+        plugins_dir = os.path.join(self.cfg, "plugins")
+        os.makedirs(plugins_dir, exist_ok=True)
+        with open(os.path.join(plugins_dir, "installed_plugins.json"), "w", encoding="utf-8") as f:
+            f.write("{ this is not valid json ")
+        with open(os.path.join(plugins_dir, "known_marketplaces.json"), "w", encoding="utf-8") as f:
+            f.write("]]] broken")
+        with open(os.path.join(self.cfg, "settings.json"), "w", encoding="utf-8") as f:
+            f.write("not json at all")
+        self.assertEqual(insight._load_installed_plugins(self.cfg), {})
+        self.assertEqual(insight._load_known_marketplaces(self.cfg), {})
+        self.assertEqual(insight._load_enabled_plugins(self.cfg), {})
+        # And the full builder still produces a well-formed (all-negative) result.
+        a = insight.build_adoption(insight.Corpus(), claude_dir=self.cfg)
+        self.assertFalse(a["crabi/ai-marketplace"]["installed"])
+
+
+class TestUsageSectionHtml(unittest.TestCase):
+    """_usage_section_html renders the combined Usage & Adoption block from fixture data."""
+
+    def _usage(self):
+        from collections import Counter
+        return {
+            "mcp_servers": Counter({"engram": 12, "grafana-qa": 3}),
+            "commands": Counter({"/desplega:research": 5, "/commit": 2}),
+            "work_types": {
+                "counts": {"Build": 4, "Debug": 3, "Plan": 2, "Other": 1},
+                "pct": {"Build": 40.0, "Debug": 30.0, "Plan": 20.0, "Other": 10.0},
+            },
+        }
+
+    def test_usage_section_html(self):
+        adoption = {
+            "crabi/ai-marketplace": {"installed": True, "enabled": True, "used": 7,
+                                     "plugins": ["sre", "qa"]},
+            "engram": {"installed": True, "enabled": True, "used": 12},
+            "obsidian": {"installed": True, "enabled": True, "used": 0},  # installed but never used
+        }
+        html = insight._usage_section_html(self._usage(), adoption, span_days=47)
+
+        # server display name from SERVER_DISPLAY
+        self.assertIn("Engram", html)
+        self.assertIn("Grafana (QA)", html)
+        # honest "over N days" span label, not a hard-coded 30
+        self.assertIn("over the last 47 days", html)
+        # a work-type label
+        self.assertIn("Build", html)
+        self.assertIn("Work-type mix", html)
+        # a slash command rendered
+        self.assertIn("/desplega:research", html)
+        # adoption: installed + the unused marker for the never-used tool
+        self.assertIn("installed", html)
+        self.assertIn("never used", html)
+        # the section heading
+        self.assertIn("Usage", html)
+
+    def test_usage_section_empty_payload_renders_nothing(self):
+        self.assertEqual(insight._usage_section_html({}, {}, span_days=0), "")
+
+    def test_usage_section_no_span_uses_history_label(self):
+        html = insight._usage_section_html(self._usage(), {}, span_days=0)
+        self.assertIn("over your history", html)
+        self.assertNotIn("over the last 0 days", html)
+
+
+class TestEvidenceAdoption(unittest.TestCase):
+    """build_evidence carries the descriptive usage/adoption block, and that block must
+    NOT change run_fingerprint (which is keyed only on real_prompts)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def _bundle(self):
+        recs = [
+            user_text("add a /health endpoint to server.py, only that file, so the LB can probe it"),
+            assistant_tool("Read", file_path="/x/server.py"),
+            assistant_tool("Edit", file_path="/x/server.py"),
+            assistant_tool("mcp__plugin_engram_engram__mem_save"),
+            user_text("run it"),
+        ]
+        write_session(self.tmp, "s.jsonl", recs)
+        corpus = insight.parse(insight.discover_files(self.tmp))
+        result = insight.analyze(corpus)
+        cards, _strength = insight.build_action_plan(corpus, result)
+        return corpus, insight.build_evidence(corpus, result, cards)
+
+    def test_evidence_adoption_block_present(self):
+        _corpus, ev = self._bundle()
+        behavior = ev["behavior"]
+        self.assertIn("usage", behavior)
+        self.assertIn("adoption", behavior)
+        usage = behavior["usage"]
+        # the engram mem_save call grouped under its server
+        self.assertEqual(usage["mcp_servers"].get("engram"), 1)
+        for k in ("mcp_servers", "commands", "work_types"):
+            self.assertIn(k, usage)
+        # adoption carries the crabi target plus the named tools, with the trichotomy keys
+        self.assertIn("crabi/ai-marketplace", behavior["adoption"])
+        for tgt, state in behavior["adoption"].items():
+            self.assertIn("installed", state)
+            self.assertIn("used", state)
+
+    def test_evidence_adoption_fingerprint_stable(self):
+        # The merge-gate hashes only real_prompts; the descriptive usage/adoption block
+        # must never shift it. Compare the fingerprint of the corpus to a re-parse that
+        # carries the same prompts but extra MCP/command stubs (which feed usage/adoption).
+        corpus, _ev = self._bundle()
+        fp_plain = insight._run_fingerprint(corpus)
+
+        other = tempfile.mkdtemp()
+        write_session(other, "s.jsonl", [
+            user_text("add a /health endpoint to server.py, only that file, so the LB can probe it"),
+            assistant_tool("Read", file_path="/x/server.py"),
+            assistant_tool("Edit", file_path="/x/server.py"),
+            assistant_tool("mcp__plugin_engram_engram__mem_save"),
+            assistant_tool("mcp__plugin_engram_engram__mem_search"),       # extra usage signal
+            user_text("<command-name>/desplega:research</command-name>"),  # extra command signal
+            user_text("run it"),
+        ])
+        corpus2 = insight.parse(insight.discover_files(other))
+        # the extra stubs DID feed usage/adoption ...
+        self.assertGreater(insight.build_evidence(
+            corpus2, insight.analyze(corpus2),
+            insight.build_action_plan(corpus2, insight.analyze(corpus2))[0]
+        )["behavior"]["usage"]["mcp_servers"].get("engram"), 1)
+        # ... but the fingerprint is identical: same real_prompts, byte-for-byte.
+        self.assertEqual(fp_plain, insight._run_fingerprint(corpus2))
 
 
 if __name__ == "__main__":
