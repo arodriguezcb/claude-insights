@@ -730,5 +730,69 @@ class TestRealPromptsRegressionGuard(unittest.TestCase):
         self.assertEqual(b.mcp_servers["engram"], 1)
 
 
+class TestWorkTypeBuckets(unittest.TestCase):
+    """classify_work_types buckets timeline events into Build/Debug/Plan/Other proportions."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def test_work_type_buckets(self):
+        # 4 edits (Build), 3 verify-cmds (Debug), 2 plan-skills (Plan), 1 read (Other) -> 10 events.
+        recs = (
+            [assistant_tool("Write", file_path="/a.py")] * 2
+            + [assistant_tool("Edit", file_path="/b.py")] * 2
+            + [assistant_tool("Bash", command="python -m pytest -q")] * 3
+            + [assistant_tool("ExitPlanMode")] * 2          # name 'exitplanmode' contains 'plan'
+            + [assistant_tool("Read", file_path="/c.py")]   # Other
+        )
+        write_session(self.tmp, "s.jsonl", recs)
+        corpus = insight.parse(insight.discover_files(self.tmp))
+        mix = insight.classify_work_types(corpus)
+        self.assertEqual(mix["counts"], {"Build": 4, "Debug": 3, "Plan": 2, "Other": 1})
+        self.assertAlmostEqual(mix["pct"]["Build"], 40.0)
+        self.assertAlmostEqual(mix["pct"]["Debug"], 30.0)
+        self.assertAlmostEqual(mix["pct"]["Plan"], 20.0)
+        self.assertAlmostEqual(mix["pct"]["Other"], 10.0)
+        # percentages sum to 100 (± rounding)
+        self.assertAlmostEqual(sum(mix["pct"].values()), 100.0)
+
+    def test_work_type_precedence_build_over_debug(self):
+        # an edit tool that somehow also carries a verify cmd is Build, not Debug (precedence).
+        recs = [assistant_tool("Write", file_path="/a.py", command="pytest")]
+        write_session(self.tmp, "s.jsonl", recs)
+        corpus = insight.parse(insight.discover_files(self.tmp))
+        mix = insight.classify_work_types(corpus)
+        # Write does not capture `command` (only Bash does), so cmd is None and this is plain Build;
+        # the assertion still guards that an edit lands in Build.
+        self.assertEqual(mix["counts"]["Build"], 1)
+        self.assertEqual(mix["counts"]["Debug"], 0)
+
+    def test_work_type_plan_from_commands(self):
+        # Planning runs through slash commands, not timeline events: a plan-ish command must
+        # land in Plan even with no plan-named timeline event. 1 edit (Build) + 1 read (Other)
+        # in the timeline, plus /desplega:research x2 and /plan x1 in corpus.commands -> Plan 3.
+        recs = [
+            user_text("<command-name>/desplega:research</command-name>"),
+            assistant_tool("Write", file_path="/a.py"),
+            assistant_tool("Read", file_path="/c.py"),
+            user_text("<command-name>/desplega:research</command-name>"),
+            user_text("<command-name>/plan</command-name>"),
+            user_text("<command-name>/commit</command-name>"),   # not plan-ish -> ignored
+        ]
+        write_session(self.tmp, "s.jsonl", recs)
+        corpus = insight.parse(insight.discover_files(self.tmp))
+        mix = insight.classify_work_types(corpus)
+        self.assertEqual(mix["counts"]["Plan"], 3)
+        self.assertEqual(mix["counts"]["Build"], 1)
+        self.assertEqual(mix["counts"]["Other"], 1)
+        self.assertAlmostEqual(sum(mix["pct"].values()), 100.0)
+
+    def test_work_type_empty_corpus(self):
+        corpus = insight.Corpus()
+        mix = insight.classify_work_types(corpus)
+        self.assertEqual(mix["counts"], {"Build": 0, "Debug": 0, "Plan": 0, "Other": 0})
+        self.assertEqual(sum(mix["pct"].values()), 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()

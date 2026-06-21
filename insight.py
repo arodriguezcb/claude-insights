@@ -651,6 +651,51 @@ def _iter_sessions(corpus):
         yield sid, s["project"], s["timeline"]
 
 
+# Planning skills/commands surface in a timeline event's `name` as one of these tokens.
+_PLAN_NAME_RE = re.compile(r"plan|research|brainstorm", re.I)
+
+
+def classify_work_types(corpus):
+    """Coarse Build/Debug/Plan/Other mix over every timeline event.
+
+    Pure post-parse: reads only `corpus.sessions[*]["timeline"]`, touches nothing scored.
+    Each event lands in exactly one bucket, by already-present signals:
+      * Build  — tool event whose `name` is an edit tool (EDIT_TOOLS).
+      * Debug  — tool event whose `cmd` matches VERIFY_RE (test/build/run invocations).
+      * Plan   — event `name` reads as a planning skill/command (plan/research/brainstorm),
+                 plus plan-ish slash-command invocations from `corpus.commands` (see below).
+      * Other  — everything else (reads, prompts, misc tools).
+
+    Returns {"counts": {bucket: int}, "pct": {bucket: float}}; pct is over all classified
+    events and sums to ~100 (± rounding). Ponytail ceiling: this is a coarse per-event
+    heuristic; when an event matches more than one signal, precedence is Build > Debug >
+    Plan > Other.
+    """
+    buckets = ["Build", "Debug", "Plan", "Other"]
+    counts = {b: 0 for b in buckets}
+    for _sid, _project, timeline in _iter_sessions(corpus):
+        for ev in timeline:
+            name = (ev.get("name") or "")
+            cmd = ev.get("cmd") or ""
+            if name in EDIT_TOOLS:
+                counts["Build"] += 1
+            elif cmd and VERIFY_RE.search(cmd):
+                counts["Debug"] += 1
+            elif _PLAN_NAME_RE.search(name):
+                counts["Plan"] += 1
+            else:
+                counts["Other"] += 1
+    # Planning runs through slash commands (counted in corpus.commands), which never reach the
+    # timeline — without this fold the Plan bucket reads ~0% on real data. ponytail: commands
+    # aren't timeline events; counting plan-ish invocations is the cheap, parse()-free fix.
+    for cmd, n in corpus.commands.items():
+        if _PLAN_NAME_RE.search(cmd):
+            counts["Plan"] += n
+    total = sum(counts.values())
+    pct = {b: (100.0 * counts[b] / total if total else 0.0) for b in buckets}
+    return {"counts": counts, "pct": pct}
+
+
 def _find_corrections(corpus):
     """Correction turns: short rejections that follow an assistant action, praise-guarded."""
     out = []
