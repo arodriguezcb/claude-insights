@@ -633,5 +633,102 @@ class TestPersonalizedGrowthAndQuiet(unittest.TestCase):
         self.assertIn("not</b> from your sessions", html)
 
 
+class TestMcpServerGrouping(unittest.TestCase):
+    """MCP calls are grouped by server-id (plugin infix stripped) without disturbing tool_usage."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def test_mcp_server_grouping(self):
+        recs = [
+            assistant_tool("mcp__plugin_sre_jaeger-qa__find-traces"),
+            assistant_tool("mcp__plugin_engram_engram__mem_save"),
+            assistant_tool("mcp__grafana-qa__query_prometheus"),
+            assistant_tool("Read", file_path="/x.py"),  # non-MCP, must not appear as a server
+        ]
+        write_session(self.tmp, "s.jsonl", recs)
+        corpus = insight.parse(insight.discover_files(self.tmp))
+        self.assertEqual(corpus.mcp_servers["jaeger-qa"], 1)
+        self.assertEqual(corpus.mcp_servers["engram"], 1)
+        self.assertEqual(corpus.mcp_servers["grafana-qa"], 1)
+        # the plugin_ infix never leaks through
+        self.assertNotIn("plugin_sre_jaeger-qa", corpus.mcp_servers)
+        self.assertNotIn("plugin_engram_engram", corpus.mcp_servers)
+        # a non-MCP tool contributes no server entry
+        self.assertNotIn("Read", corpus.mcp_servers)
+        # tool_usage still holds the de-namespaced tool names, unchanged
+        self.assertEqual(corpus.tool_usage["find-traces"], 1)
+        self.assertEqual(corpus.tool_usage["mem_save"], 1)
+        self.assertEqual(corpus.tool_usage["query_prometheus"], 1)
+        self.assertEqual(corpus.tool_usage["Read"], 1)
+
+    def test_mcp_server_unit(self):
+        self.assertEqual(insight._mcp_server("mcp__plugin_sre_jaeger-qa__find-traces"), "jaeger-qa")
+        self.assertEqual(insight._mcp_server("mcp__plugin_engram_engram__mem_save"), "engram")
+        self.assertEqual(insight._mcp_server("mcp__grafana-qa__query_prometheus"), "grafana-qa")
+        self.assertIsNone(insight._mcp_server("Read"))
+        self.assertIsNone(insight._mcp_server("Bash"))
+
+
+class TestCommandCounting(unittest.TestCase):
+    """Slash-command stubs are counted while remaining filtered out of real_prompts."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def test_command_counting(self):
+        recs = [
+            user_text("<command-name>/foo</command-name>"),
+            user_text("<command-name>/desplega:research</command-name>"),
+            user_text("<command-name>/foo</command-name>"),
+        ]
+        write_session(self.tmp, "s.jsonl", recs)
+        corpus = insight.parse(insight.discover_files(self.tmp))
+        self.assertEqual(corpus.commands["/foo"], 2)
+        self.assertEqual(corpus.commands["/desplega:research"], 1)
+        # command stubs are still filtered from the scored corpus
+        self.assertEqual(len(corpus.real_prompts), 0)
+
+    def test_command_name_unit(self):
+        self.assertEqual(insight._command_name("<command-name>/foo</command-name>"), "/foo")
+        self.assertEqual(insight._command_name("<command-name> /desplega:research </command-name>"),
+                         "/desplega:research")
+        self.assertIsNone(insight._command_name("just a normal prompt"))
+
+
+class TestRealPromptsRegressionGuard(unittest.TestCase):
+    """real_prompts is byte-identical with or without command/MCP stubs mixed in."""
+
+    def setUp(self):
+        self.tmp_a = tempfile.mkdtemp()
+        self.tmp_b = tempfile.mkdtemp()
+
+    def test_real_prompts_regression_identical(self):
+        real_only = [
+            user_text("add a login endpoint to api.py"),
+            user_text("run the tests"),
+        ]
+        with_stubs = [
+            user_text("<command-name>/foo</command-name>"),       # command stub
+            user_text("add a login endpoint to api.py"),
+            assistant_tool("mcp__plugin_engram_engram__mem_save"),  # mcp call
+            user_text("<command-name>/desplega:research</command-name>"),
+            user_text("run the tests"),
+            assistant_tool("mcp__grafana-qa__query_prometheus"),
+        ]
+        write_session(self.tmp_a, "s.jsonl", real_only)
+        write_session(self.tmp_b, "s.jsonl", with_stubs)
+        a = insight.parse(insight.discover_files(self.tmp_a))
+        b = insight.parse(insight.discover_files(self.tmp_b))
+        a_texts = [p["text"] for p in a.real_prompts]
+        b_texts = [p["text"] for p in b.real_prompts]
+        # same length AND same contents — the additive guarantee at the corpus level
+        self.assertEqual(len(a_texts), len(b_texts))
+        self.assertEqual(a_texts, b_texts)
+        # and the new counters DID pick up the stubs in the b run
+        self.assertEqual(b.commands["/foo"], 1)
+        self.assertEqual(b.mcp_servers["engram"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

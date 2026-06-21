@@ -284,6 +284,15 @@ def _is_tool_result(content):
     )
 
 
+_COMMAND_NAME_RE = re.compile(r"<command-name>\s*(/?[^<]+?)\s*</command-name>")
+
+
+def _command_name(text):
+    """Pull the slash-command name out of a <command-name>…</command-name> stub, else None."""
+    m = _COMMAND_NAME_RE.search(text)
+    return m.group(1) if m else None
+
+
 def _looks_injected(text):
     head = text[:200].lstrip()
     if len(text) > MAX_HUMAN_PROMPT_CHARS:
@@ -300,6 +309,29 @@ def _denamespace_tool(name):
         parts = name.split("__")
         return parts[-1] if parts else name
     return name
+
+
+def _mcp_server(raw):
+    """mcp__<server>__<tool> -> <server>; strip a leading 'plugin_<plugin>_' wrapper.
+
+    mcp__grafana-qa__query_prometheus        -> grafana-qa
+    mcp__plugin_sre_jaeger-qa__find-traces   -> jaeger-qa
+    mcp__plugin_engram_engram__mem_save      -> engram
+
+    Returns None for non-MCP tool names. Ponytail ceiling: the only assumption is that
+    the plugin name is a single, '_'-free token, so dropping the first '_'-delimited
+    token of the wrapper yields the server-id.
+    """
+    if not raw.startswith("mcp__"):
+        return None
+    parts = raw.split("__")
+    if len(parts) < 2:
+        return None
+    server = parts[1]
+    if server.startswith("plugin_"):
+        rest = server[len("plugin_"):]            # 3.8-safe: slice, not str.removeprefix
+        server = rest.split("_", 1)[1] if "_" in rest else rest
+    return server
 
 
 # Redact machine-identifying home paths from free text before it is shown in the report or
@@ -329,6 +361,8 @@ class Corpus:
         self.filtered = Counter()       # why user records were not counted as prompts
         self.real_prompts = []          # list of dicts: text, project, session, idx
         self.tool_usage = Counter()     # de-namespaced tool name -> count
+        self.mcp_servers = Counter()    # mcp server-id (plugin infix stripped) -> call count
+        self.commands = Counter()       # slash-command name -> count
         self.total_tool_calls = 0
         self.delegation_events = 0
         self.first_ts = None
@@ -479,6 +513,9 @@ def parse(files):
                         for b in content:
                             if isinstance(b, dict) and b.get("type") == "tool_use":
                                 raw = b.get("name", "unknown")
+                                srv = _mcp_server(raw)
+                                if srv:
+                                    c.mcp_servers[srv] += 1
                                 name = _denamespace_tool(raw)
                                 c.tool_usage[name] += 1
                                 c.total_tool_calls += 1
@@ -511,6 +548,9 @@ def parse(files):
                 if not text:
                     c.filtered["empty"] += 1
                     continue
+                cmd = _command_name(text)
+                if cmd:
+                    c.commands[cmd] += 1
                 if _looks_injected(text):
                     c.filtered["injected / pasted"] += 1
                     continue
