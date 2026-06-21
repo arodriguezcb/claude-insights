@@ -31,7 +31,8 @@ Python 3.8+ and Claude Code.
 - **A 4-competency skill map** — **Delegation · Description · Discernment · Diligence** (the AI Fluency framework) — each placed on a 1–5 level with one concrete next move.
 - **Five measured dimensions** behind the map — Briefing, Verification, Context-setting, Iteration, Toolcraft — each a defensible rate, not a vanity count.
 - **What / Where / How** — your top growth levers, each tied to real moments in your transcripts and (when you run the full skill) a rewrite of one of *your own* prompts.
-- **Full transparency** on the data: how many prompts you really typed (vs. tool output, subagent turns, and injected noise), projects, MB, and hands-on time — across **more than the 30 days Claude Code keeps on disk** (see below).
+- **Usage & Crabi-tool adoption** — how your tool time splits across work types (Build · Debug · Plan · Investigate · Shell/Ops · Delegate · Other), your most-used MCP servers and slash commands, and which marketplace plugins you actually use vs. have installed but never touched.
+- **Honest data accounting** — how many real prompts you typed, projects, MB, and hands-on time — across **more than the 30 days Claude Code keeps on disk** (see below).
 
 ## 🎯 How the score works (and what it won't do)
 
@@ -59,8 +60,7 @@ The whole point is to measure *skill*, not activity — so a few things are deli
   chars) don't count as your prompts. Idle gaps longer than 5 minutes are excluded from
   "active time," so it's hands-on time, not wall-clock.
 
-Both the raw and the confidence-adjusted scores are shown in the report, and the full
-methodology is in an appendix at the bottom of it.
+Both the raw and the confidence-adjusted scores are shown in the report.
 
 ## 🧠 One command, the full analysis
 
@@ -161,8 +161,9 @@ python3 insight.py                 # analyze ~/.claude/projects, then write + op
 
 *(Illustrative — your numbers will differ.)* The HTML report adds the headline score ring,
 the four-competency skill map (your level and next move for each), the five dimensions,
-your top growth levers with before/after rewrites, archetype affinity, a "how much data
-this is based on" breakdown, and a methodology appendix.
+your top growth levers with before/after rewrites, archetype affinity, a Usage &
+Crabi-tool adoption section (work-type mix, MCP / slash-command usage, and per-plugin
+adoption), and a "how much data this is based on" breakdown.
 
 ## 🏗️ Architecture
 
@@ -197,6 +198,19 @@ Adapted from Anthropic's *AI Fluency: Frameworks & Foundations* (the 4 Ds):
 
 (Verification and Context-setting are largely habits Claude drives on its own — counted in
 the collaboration score, discounted in the archetype.)
+
+### Usage & Crabi-tool adoption
+Beyond the score, the report shows how you *spend* Claude Code (additive — none of it
+changes the scoring):
+- **Work-type mix** — every tool action bucketed into Build, Debug, Plan, Investigate
+  (reads + observability queries), Shell/Ops, Delegate (sub-agent / workflow spawns), or
+  Other. Prompts are excluded — this measures actions, not chat.
+- **MCP & slash-command usage** — your most-called MCP servers (grouped, plugin infix
+  stripped) and top slash commands over the measured window.
+- **Crabi marketplace adoption** — for each installed plugin, whether it's installed,
+  enabled, and actually *used*, with a per-plugin breakdown (counted across slash-command,
+  MCP, and sub-agent channels) that flags tools you have on hand but never reach for. Read
+  live and offline from your local plugin config — nothing leaves your machine.
 
 ### Archetypes (from *your* behavior, not keywords)
 - **🤖 Autonomous Agent** — delegates whole, end-to-end jobs and trusts the agent to run them.
