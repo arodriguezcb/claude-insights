@@ -122,6 +122,8 @@ const analystPrompt =
   `do not invent or paraphrase it) and example_after is your tailored rewrite of THAT exact prompt, ready ` +
   `to paste, fixing the specific gap. Pack it with signal: name their files, tools, projects, and phrasing. ` +
   `If two growth items would share the same before/after, replace one so no example repeats. ` +
+  `If behavior.adoption shows a tool that is installed (and enabled) but never used (used == 0), ` +
+  `make one growth card a concrete nudge to adopt it — name the tool and what it would do for them. ` +
   `Respect agency (discount Claude-driven habits) and confidence (hedge thin signals). ` +
   `Every claim — and every example_before — must be grounded in the evidence.`
 let analysis = await agent(analystPrompt, { label: 'analyze', phase: 'Analyze', model: 'opus', schema: ANALYSIS })

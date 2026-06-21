@@ -31,3 +31,6 @@ insight-archive/
 
 # macOS
 .DS_Store
+
+
+.thoughts/*
