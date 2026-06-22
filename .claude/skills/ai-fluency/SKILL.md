@@ -80,12 +80,28 @@ On success the report carries Opus's tailored, framework-grounded skill map AND 
 highest-leverage growth moves (each rewriting one of your real prompts) on top of the
 deterministic numbers. Point the user to `~/.claude/insight/ai_fluency_report.html`.
 
+## Step 3b — Always publish the report as an Artifact
+
+Every render also writes a content-only sibling at
+`~/.claude/insight/ai_fluency_report.artifact.html` (the engine strips the
+`<!doctype>/<head>/<body>` wrapper the Artifact tool adds itself). Publish it so the user
+gets a shareable, cache-proof hosted report instead of only a local `file://` link — call
+the **Artifact** tool with:
+- `file_path`: `~/.claude/insight/ai_fluency_report.artifact.html`
+- `favicon`: `📊`
+
+The Artifact is **default-private** on the user's claude.ai account, but it does upload the
+report (which contains their scrubbed prompt excerpts and tool usage) there — so this only
+runs as part of the report they explicitly asked for. If the Artifact tool isn't available
+in this environment, skip this step and point the user to the local file instead.
+
 ## Step 4 — Narrate (don't re-derive)
 
 Only now, after the final report exists, give a short, encouraging read in chat: the
 **overall score + band + archetype** in one sentence, the **single highest-leverage growth
 move** grounded in one of their real prompts, and their **strongest competency** as the
-foundation. Keep it to a paragraph or two; the report has the depth.
+foundation. Keep it to a paragraph or two; the report has the depth. Give them the Artifact
+URL from Step 3b as the primary link (with the local file path as a fallback).
 
 ## Fallbacks
 
