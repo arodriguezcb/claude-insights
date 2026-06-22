@@ -11,7 +11,7 @@ touched.
 ## ⚡ Install in 5 seconds
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Feloguarin/claude-insight/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/arodriguezcb/claude-insights/main/install.sh | bash
 ```
 
 That drops the **`/ai-fluency`** skill into Claude Code. Then, inside Claude Code (any
@@ -146,8 +146,8 @@ By default Claude Code **deletes transcripts older than its `cleanupPeriodDays` 
 `pip install`:
 
 ```bash
-git clone https://github.com/Feloguarin/claude-insight.git
-cd claude-insight
+git clone https://github.com/arodriguezcb/claude-insights.git
+cd claude-insights
 python3 insight.py                 # analyze ~/.claude/projects, then write + open the report
 ```
 
