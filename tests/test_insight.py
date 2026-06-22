@@ -6,6 +6,7 @@ rate-based scoring that can't be inflated by volume, gap-capped active time,
 and confidence shrinkage of thin signals. Pure stdlib unittest.
 """
 import contextlib
+import datetime
 import glob
 import io
 import json
@@ -825,12 +826,22 @@ class TestWorkTypeBuckets(unittest.TestCase):
         self.assertEqual(sum(mix["pct"].values()), 0.0)
 
 
-def _write_claude_config(root, installed, marketplaces, enabled):
-    """Write fake ~/.claude config (installed_plugins / known_marketplaces / settings)."""
+def _write_claude_config(root, installed, marketplaces, enabled, catalogs=None,
+                         installed_versions=None):
+    """Write fake ~/.claude config (installed_plugins / known_marketplaces / settings).
+
+    Optional:
+      installed_versions: {plugin_id -> version} overriding the default "1.0.0" install record.
+      catalogs: {marketplace_name -> [{"name","version"}, ...]} — writes each marketplace's
+        local clone manifest at plugins/marketplaces/<name>/.claude-plugin/marketplace.json,
+        the source build_adoption reads "latest" versions from."""
     plugins_dir = os.path.join(root, "plugins")
     os.makedirs(plugins_dir, exist_ok=True)
+    installed_versions = installed_versions or {}
     # installed_plugins: plugins[id] is a LIST of install records (we index [0]).
-    inst = {"version": 1, "plugins": {pid: [{"version": "1.0.0"}] for pid in installed}}
+    inst = {"version": 1,
+            "plugins": {pid: [{"version": installed_versions.get(pid, "1.0.0")}]
+                        for pid in installed}}
     with open(os.path.join(plugins_dir, "installed_plugins.json"), "w", encoding="utf-8") as f:
         json.dump(inst, f)
     mkt = {name: {"source": {"source": "github", "repo": repo}}
@@ -839,6 +850,11 @@ def _write_claude_config(root, installed, marketplaces, enabled):
         json.dump(mkt, f)
     with open(os.path.join(root, "settings.json"), "w", encoding="utf-8") as f:
         json.dump({"enabledPlugins": enabled}, f)
+    for name, plugins in (catalogs or {}).items():
+        cdir = os.path.join(plugins_dir, "marketplaces", name, ".claude-plugin")
+        os.makedirs(cdir, exist_ok=True)
+        with open(os.path.join(cdir, "marketplace.json"), "w", encoding="utf-8") as f:
+            json.dump({"plugins": plugins}, f)
 
 
 class TestAdoption(unittest.TestCase):
@@ -1116,6 +1132,270 @@ class TestEvidenceAdoption(unittest.TestCase):
         )["behavior"]["usage"]["mcp_servers"].get("engram"), 1)
         # ... but the fingerprint is identical: same real_prompts, byte-for-byte.
         self.assertEqual(fp_plain, insight._run_fingerprint(corpus2))
+
+
+class TestVersionCapture(unittest.TestCase):
+    """corpus.cc_version is the version off the LATEST event that actually carries one."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def _corpus(self, recs):
+        write_session(self.tmp, "s.jsonl", recs)
+        return insight.parse(insight.discover_files(self.tmp))
+
+    def test_latest_versioned_event_wins(self):
+        corpus = self._corpus([
+            user_text("first", ts="2026-01-01T00:00:00Z", version="2.1.100"),
+            user_text("later", ts="2026-01-02T00:00:00Z", version="2.1.185"),
+        ])
+        self.assertEqual(corpus.cc_version, "2.1.185")
+
+    def test_none_when_no_version_key(self):
+        corpus = self._corpus([
+            user_text("a", ts="2026-01-01T00:00:00Z"),
+            user_text("b", ts="2026-01-02T00:00:00Z"),
+        ])
+        self.assertIsNone(corpus.cc_version)
+
+    def test_earlier_version_wins_when_latest_event_unversioned(self):
+        # The MAX-ts event has no `version`; an earlier one does. cc_version must be the
+        # earlier (non-None) version, never None (regression guard for the ~28% unversioned).
+        corpus = self._corpus([
+            user_text("has version", ts="2026-01-01T00:00:00Z", version="2.1.150"),
+            user_text("newest, no version", ts="2026-01-03T00:00:00Z"),
+        ])
+        self.assertEqual(corpus.cc_version, "2.1.150")
+
+
+class TestOutdated(unittest.TestCase):
+    """_version_outdated: dotted-int compare with unknown -> None (never a false claim)."""
+
+    def test_installed_behind_latest_is_true(self):
+        self.assertIs(insight._version_outdated("0.1.0", "0.1.1"), True)
+
+    def test_equal_is_false(self):
+        self.assertIs(insight._version_outdated("0.1.1", "0.1.1"), False)
+
+    def test_installed_ahead_is_false(self):
+        self.assertIs(insight._version_outdated("0.2.0", "0.1.1"), False)
+
+    def test_unknown_or_missing_or_unparseable_is_none(self):
+        self.assertIsNone(insight._version_outdated("unknown", "0.1.1"))
+        self.assertIsNone(insight._version_outdated("0.1.0", None))
+        self.assertIsNone(insight._version_outdated(None, "0.1.0"))
+        self.assertIsNone(insight._version_outdated("0.1.0", "unknown"))
+        self.assertIsNone(insight._version_outdated("not-a-version", "0.1.0"))
+
+    def test_breakdown_entry_marks_outdated(self):
+        cfg = tempfile.mkdtemp()
+        tmp = tempfile.mkdtemp()
+        _write_claude_config(
+            cfg,
+            installed=["sre@crabi-ai-marketplace"],
+            marketplaces={"crabi-ai-marketplace": "crabi/ai-marketplace"},
+            enabled={"sre@crabi-ai-marketplace": True},
+            installed_versions={"sre@crabi-ai-marketplace": "0.1.0"},
+            catalogs={"crabi-ai-marketplace": [{"name": "sre", "version": "0.1.1"}]},
+        )
+        write_session(tmp, "s.jsonl", [user_text("hi")])
+        corpus = insight.parse(insight.discover_files(tmp))
+        a = insight.build_adoption(corpus, claude_dir=cfg)
+        sre = next(p for p in a["crabi/ai-marketplace"]["plugin_breakdown"] if p["name"] == "sre")
+        self.assertEqual(sre["installed_version"], "0.1.0")
+        self.assertEqual(sre["latest_version"], "0.1.1")
+        self.assertIs(sre["outdated"], True)
+
+
+class TestFullCatalogAdoption(unittest.TestCase):
+    """build_adoption emits a breakdown over the UNION of catalog + installed plugins."""
+
+    def setUp(self):
+        self.cfg = tempfile.mkdtemp()
+        self.tmp = tempfile.mkdtemp()
+
+    def _corpus(self, recs):
+        write_session(self.tmp, "s.jsonl", recs)
+        return insight.parse(insight.discover_files(self.tmp))
+
+    def test_not_installed_catalog_plugin_appears(self):
+        # Catalog lists sre + infra; only sre is installed. infra must show up as
+        # installed=False / used=0 (the real not-installed coaching case).
+        _write_claude_config(
+            self.cfg,
+            installed=["sre@crabi-ai-marketplace"],
+            marketplaces={"crabi-ai-marketplace": "crabi/ai-marketplace"},
+            enabled={"sre@crabi-ai-marketplace": True},
+            catalogs={"crabi-ai-marketplace": [
+                {"name": "sre", "version": "0.1.0"},
+                {"name": "infra", "version": "0.2.0"},
+            ]},
+        )
+        corpus = self._corpus([user_text("<command-name>/sre:query-logs</command-name>")])
+        a = insight.build_adoption(corpus, claude_dir=self.cfg)
+        bd = {p["name"]: p for p in a["crabi/ai-marketplace"]["plugin_breakdown"]}
+        self.assertIn("infra", bd)
+        self.assertFalse(bd["infra"]["installed"])
+        self.assertEqual(bd["infra"]["used"], 0)
+        self.assertIsNone(bd["infra"]["installed_version"])
+        self.assertEqual(bd["infra"]["latest_version"], "0.2.0")
+        # installed plugin carries installed=True + its install-record version.
+        self.assertTrue(bd["sre"]["installed"])
+        self.assertEqual(bd["sre"]["used"], 1)
+        self.assertEqual(bd["sre"]["installed_version"], "1.0.0")
+
+    def test_missing_manifest_falls_back_to_installed_only(self):
+        # No catalog written -> _load_marketplace_catalog returns {} -> breakdown is the
+        # installed crabi plugins only, with no error.
+        _write_claude_config(
+            self.cfg,
+            installed=["sre@crabi-ai-marketplace", "qa@crabi-ai-marketplace"],
+            marketplaces={"crabi-ai-marketplace": "crabi/ai-marketplace"},
+            enabled={"sre@crabi-ai-marketplace": True},
+        )
+        corpus = self._corpus([user_text("hi")])
+        a = insight.build_adoption(corpus, claude_dir=self.cfg)
+        names = sorted(p["name"] for p in a["crabi/ai-marketplace"]["plugin_breakdown"])
+        self.assertEqual(names, ["qa", "sre"])  # installed-only, no catalog extras
+        for p in a["crabi/ai-marketplace"]["plugin_breakdown"]:
+            self.assertTrue(p["installed"])
+            self.assertIsNone(p["latest_version"])
+
+    def test_suggested_tool_carries_version_and_outdated(self):
+        # A named-tool target (engram) gets installed/latest versions + outdated, resolved
+        # via its marketplace NAME (the plugin_id suffix), not a repo slug.
+        _write_claude_config(
+            self.cfg,
+            installed=["engram@engram"],
+            marketplaces={"engram": "Gentleman-Programming/engram"},
+            enabled={"engram@engram": True},
+            installed_versions={"engram@engram": "0.1.0"},
+            catalogs={"engram": [{"name": "engram", "version": "0.1.1"}]},
+        )
+        corpus = self._corpus([user_text("hi")])
+        a = insight.build_adoption(corpus, claude_dir=self.cfg)
+        self.assertEqual(a["engram"]["installed_version"], "0.1.0")
+        self.assertEqual(a["engram"]["latest_version"], "0.1.1")
+        self.assertIs(a["engram"]["outdated"], True)
+
+    def test_superpowers_signature_present_and_not_installed(self):
+        # superpowers is a suggested tool but not installed here -> installed False, enabled None.
+        self.assertIn("superpowers", insight.SIGNATURES)
+        corpus = self._corpus([user_text("hi")])
+        a = insight.build_adoption(corpus, claude_dir=self.cfg)
+        self.assertIn("superpowers", a)
+        self.assertFalse(a["superpowers"]["installed"])
+        self.assertIsNone(a["superpowers"]["enabled"])
+
+
+class TestMetaLine(unittest.TestCase):
+    """The header meta line surfaces evaluated date + CC version + (guarded) activity window."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def _render(self, recs, generated_at, cc_version=None, null_window=False):
+        write_session(self.tmp, "s.jsonl", recs)
+        corpus = insight.parse(insight.discover_files(self.tmp))
+        if cc_version is not None:
+            corpus.cc_version = cc_version
+        if null_window:
+            corpus.first_ts = None
+            corpus.last_ts = None
+        result = insight.analyze(corpus)
+        cards, strength = insight.build_action_plan(corpus, result)
+        return insight.build_html(corpus, result, cards, strength, generated_at=generated_at)
+
+    def test_meta_line_renders_date_version_window(self):
+        gen = datetime.datetime(2026, 6, 21, 9, 30)
+        html = self._render(
+            [user_text("add a /health endpoint to server.py", ts="2026-01-01T00:00:00Z"),
+             user_text("run it", ts="2026-01-08T00:00:00Z")],
+            generated_at=gen, cc_version="2.1.185")
+        self.assertIn("Evaluated 2026-06-21", html)
+        self.assertIn("Claude Code v2.1.185", html)
+        # activity-window range with both endpoints present
+        self.assertIn("activity 2026-01-01", html)
+        self.assertIn("2026-01-08", html)
+
+    def test_meta_line_without_timestamps_omits_window(self):
+        # A corpus with no first/last ts must still render date + version, and NOT crash on a
+        # None date or print the activity-window segment.
+        gen = datetime.datetime(2026, 6, 21)
+        html = self._render([user_text("hi")], generated_at=gen, cc_version="2.0.0",
+                            null_window=True)
+        # the meta line itself is exactly date + version, with no activity-window segment
+        self.assertIn('<p class="meta">Evaluated 2026-06-21 · Claude Code v2.0.0</p>', html)
+        # the activity-window segment (` · activity <date> → <date>`) never rendered
+        self.assertNotIn("· activity", html)
+
+    def test_meta_line_unknown_version_renders_dash(self):
+        gen = datetime.datetime(2026, 6, 21)
+        html = self._render([user_text("hi")], generated_at=gen, cc_version=None)
+        self.assertIn("Claude Code v—", html)
+
+
+class TestTwoSectionAdoption(unittest.TestCase):
+    """_usage_section_html renders both 'suggested plugins' and 'marketplace' sub-sections,
+    with not-installed / superpowers / outdated markers."""
+
+    def _usage(self):
+        from collections import Counter
+        return {"mcp_servers": Counter({"engram": 3}), "commands": Counter(), "work_types": {}}
+
+    def test_two_sub_sections_with_status_and_outdated(self):
+        adoption = {
+            # named-tool (suggested) targets
+            "engram": {"installed": True, "enabled": True, "used": 3,
+                       "installed_version": "0.1.0", "latest_version": "0.1.1", "outdated": True},
+            "superpowers": {"installed": False, "enabled": None, "used": 0,
+                            "installed_version": None, "latest_version": None, "outdated": None},
+            # marketplace catalog
+            "crabi/ai-marketplace": {
+                "installed": True, "enabled": True, "used": 2,
+                "plugin_breakdown": [
+                    {"name": "sre", "installed": True, "used": 2,
+                     "installed_version": "0.1.0", "latest_version": "0.1.0", "outdated": False},
+                    {"name": "infra", "installed": False, "used": 0,
+                     "installed_version": None, "latest_version": "0.2.0", "outdated": None},
+                    {"name": "qa", "installed": True, "used": 0,
+                     "installed_version": "0.1.0", "latest_version": "0.2.0", "outdated": True},
+                ],
+            },
+        }
+        html = insight._usage_section_html(self._usage(), adoption, span_days=30)
+
+        # Both sub-section headings
+        self.assertIn("Crabi suggested plugins", html)
+        self.assertIn("Crabi AI marketplace", html)
+        # superpowers appears as not-installed
+        self.assertIn("Engram (memory)", html)  # friendly label for the suggested tool
+        self.assertIn("not installed", html)
+        # a not-installed catalog plugin shows the not-installed label
+        self.assertIn("infra", html)
+        # outdated marker on the outdated suggested tool + outdated catalog plugin
+        self.assertIn("update available", html)
+        self.assertIn("v0.1.0 → v0.1.1", html)  # engram, suggested
+        self.assertIn("v0.1.0 → v0.2.0", html)  # qa, marketplace
+        # a current (outdated=False) plugin makes NO version claim
+        self.assertNotIn("v0.1.0 → v0.1.0", html)
+        # marketplace status labels
+        self.assertIn("installed · used", html)
+        self.assertIn("installed · idle", html)
+
+    def test_outdated_none_renders_no_version_claim(self):
+        adoption = {
+            "crabi/ai-marketplace": {
+                "installed": True, "enabled": True, "used": 0,
+                "plugin_breakdown": [
+                    {"name": "data", "installed": True, "used": 1,
+                     "installed_version": "unknown", "latest_version": "0.3.0", "outdated": None},
+                ],
+            },
+        }
+        html = insight._usage_section_html(self._usage(), adoption, span_days=30)
+        self.assertIn("data", html)
+        self.assertNotIn("update available", html)
 
 
 if __name__ == "__main__":

@@ -7,6 +7,20 @@ project aims for [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **Report provenance fields** — the report now records, on a meta line under the title
+  and in the footer, the **evaluated date**, the **activity window** (`first → last
+  (N days)`), and the **Claude Code version** (read off the latest transcript event that
+  carries one). All deterministic; the activity-window segment is omitted for a
+  timestamp-less corpus rather than crashing.
+- **Two-section plugin adoption** — the adoption panel now splits into *Crabi suggested
+  plugins* (engram, obsidian, ponytail, desplega, **superpowers** as a new suggested tool,
+  shown not-installed until added) and *Crabi AI marketplace*, which lists **every plugin
+  in the catalog** — including ones you don't have — each tagged not-installed /
+  installed-idle / installed-used.
+- **Per-plugin outdated detection** — an `update available · vX → vY` marker when an
+  installed plugin's version trails the latest in your **local marketplace clone**
+  (offline, never a network call). Versions that can't be compared (missing / `unknown` /
+  unparseable) render no claim rather than a false up-to-date/outdated one.
 - **Usage & Crabi-tool adoption** report section — entirely additive after `parse()`
   (the scored corpus, fluency score, archetype, and skill map are unchanged):
   - a 7-way **work-type mix** (Build / Debug / Plan / Investigate / Shell-Ops /
@@ -24,6 +38,14 @@ project aims for [Semantic Versioning](https://semver.org/).
 - This changelog.
 
 ### Changed
+- **Report regrouped into five score-first groups** — the HTML report now reads
+  verdict → why → where you stand → what to do next → trust & method, instead of the
+  previous scattered section order, so the score and its meaning lead and the data /
+  methodology collapse into a final group.
+- **Visual restyle** — single hero score ring, bullet-style dimension bars, a quality
+  encoding that pairs label with color (legible in grayscale, not color-alone), a lifted
+  dark surface, 8-pt spacing, and a modular type scale. Presentation only; no scoring or
+  data change.
 - The installer now downloads the **latest tagged release** instead of bleeding-edge
   `main`, so a work-in-progress commit on `main` can never break a fresh install.
   It falls back to `main` only if no release exists.

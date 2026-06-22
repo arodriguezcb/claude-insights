@@ -435,6 +435,12 @@ SIGNATURES = {
         "plugin_id": "desplega@desplega-ai-toolbox",
         "namespace": "desplega",
     },
+    "superpowers": {
+        # ponytail: install key is a best-effort guess — superpowers isn't installed on this
+        # machine, so this id is unverified until it shows up in installed_plugins.json.
+        "plugin_id": "superpowers@superpowers",
+        "namespace": "superpowers",
+    },
 }
 
 # The provenance key: a plugin is "Crabi-authored" iff its marketplace resolves to this repo.
@@ -511,6 +517,71 @@ def _marketplace_repo(marketplaces, name):
     return source.get("repo")
 
 
+def _version_tuple(v):
+    """Parse a dotted-int version into a tuple, or None if missing/"unknown"/unparseable."""
+    if not isinstance(v, str) or v.strip().lower() in ("", "unknown"):
+        return None
+    try:
+        return tuple(int(p) for p in v.strip().split("."))
+    except ValueError:
+        return None
+
+
+def _version_outdated(installed, latest):
+    """True/False/None — is `installed` behind `latest`?
+
+    Returns None (unknown) when either side is missing, "unknown", or unparseable, so the
+    report never makes a false up-to-date / outdated claim. ponytail: naive dotted-int
+    compare, no prerelease/semver-build handling — fine for plugin versions."""
+    iv, lv = _version_tuple(installed), _version_tuple(latest)
+    if iv is None or lv is None:
+        return None
+    return iv < lv
+
+
+def _load_marketplace_catalog(marketplace=None, repo_slug=None, claude_dir=None):
+    """{plugin_name -> latest_version|None} from a marketplace's local clone manifest.
+
+    Resolves the marketplace entry EITHER by name (direct key in known_marketplaces) OR by
+    repo slug (the entry whose source.repo == repo_slug — used for the Crabi target). Reads
+    its installLocation (fallback <root>/plugins/marketplaces/<name>) + .claude-plugin/
+    marketplace.json. Best-effort: returns {} on any miss, never raises."""
+    root = os.path.expanduser(claude_dir or "~/.claude")
+    marketplaces = _load_known_marketplaces(claude_dir)
+
+    name = marketplace
+    entry = None
+    if name is not None:
+        entry = marketplaces.get(name)
+    elif repo_slug is not None:
+        for n, e in marketplaces.items():
+            if isinstance(e, dict):
+                src = e.get("source")
+                if isinstance(src, dict) and src.get("repo") == repo_slug:
+                    name, entry = n, e
+                    break
+    if name is None:
+        return {}
+
+    install_loc = None
+    if isinstance(entry, dict):
+        loc = entry.get("installLocation")
+        if isinstance(loc, str) and loc:
+            install_loc = os.path.expanduser(loc)
+    if install_loc is None:
+        install_loc = os.path.join(root, "plugins", "marketplaces", name)
+
+    manifest = _read_json(os.path.join(install_loc, ".claude-plugin", "marketplace.json"))
+    plugins = manifest.get("plugins")
+    if not isinstance(plugins, list):
+        return {}
+    out = {}
+    for p in plugins:
+        if isinstance(p, dict) and isinstance(p.get("name"), str):
+            out[p["name"]] = p.get("version")  # may be None / "unknown"
+    return out
+
+
 def build_adoption(corpus, claude_dir=None):
     """Per-target {installed, enabled, used} from the offline provenance join + signatures.
 
@@ -539,18 +610,35 @@ def build_adoption(corpus, claude_dir=None):
         _plugin, marketplace = pid.rsplit("@", 1)
         if _marketplace_repo(marketplaces, marketplace) == CRABI_REPO:
             crabi_ids.append(pid)
-    crabi_used = 0
+    # installed crabi plugin name -> its plugin_id (to read install record / enabled flag).
+    crabi_pid_by_name = {pid.rsplit("@", 1)[0]: pid for pid in crabi_ids}
+    crabi_used = sum(_plugin_used(corpus, name) for name in crabi_pid_by_name)
+
+    # Latest versions from the local marketplace clone (best-effort; {} if missing). Build the
+    # breakdown over the UNION of catalog names + installed crabi plugins so not-installed
+    # catalog plugins still show up. Falls back to installed-only when the catalog read misses.
+    catalog = _load_marketplace_catalog(repo_slug=CRABI_REPO, claude_dir=claude_dir)
+    names = sorted(set(catalog) | set(crabi_pid_by_name))
     breakdown = []
-    for pid in sorted(crabi_ids):
-        plugin_name = pid.rsplit("@", 1)[0]
-        u = _plugin_used(corpus, plugin_name)
-        crabi_used += u
-        breakdown.append({"name": plugin_name, "used": u, "enabled": bool(enabled.get(pid))})
+    for name in names:
+        pid = crabi_pid_by_name.get(name)
+        is_inst = pid is not None
+        inst_ver = installed[pid].get("version") if is_inst else None
+        latest_ver = catalog.get(name)
+        breakdown.append({
+            "name": name,
+            "used": _plugin_used(corpus, name),
+            "enabled": (bool(enabled.get(pid)) if is_inst else None),
+            "installed": is_inst,
+            "installed_version": inst_ver,
+            "latest_version": latest_ver,
+            "outdated": _version_outdated(inst_ver, latest_ver),
+        })
     out[CRABI_REPO] = {
         "installed": bool(crabi_ids),
         "enabled": (any(enabled.get(pid) for pid in crabi_ids) if crabi_ids else None),
         "used": crabi_used,
-        "plugins": sorted(p.rsplit("@", 1)[0] for p in crabi_ids),
+        "plugins": sorted(crabi_pid_by_name),
         "plugin_breakdown": breakdown,   # per-plugin used / never-used (multi-channel)
     }
 
@@ -570,10 +658,20 @@ def build_adoption(corpus, claude_dir=None):
         cmd_rx = sig.get("cmd_regex")
         if cmd_rx is not None:
             used += _cmd_used(corpus, cmd_rx)
+        # Per-tool version + outdated marker. installed_version comes off the install record;
+        # latest comes from the tool's marketplace clone, resolved by NAME (a suggested tool
+        # only knows its marketplace name — the plugin_id suffix — not a repo slug).
+        installed_version = installed[pid].get("version") if is_installed else None
+        mkt_name = pid.rsplit("@", 1)[1] if "@" in pid else None
+        latest_version = _load_marketplace_catalog(
+            marketplace=mkt_name, claude_dir=claude_dir).get(target) if mkt_name else None
         out[target] = {
             "installed": is_installed,
             "enabled": (bool(enabled.get(pid)) if is_installed else None),
             "used": used,
+            "installed_version": installed_version,
+            "latest_version": latest_version,
+            "outdated": _version_outdated(installed_version, latest_version),
         }
 
     return out
@@ -614,6 +712,8 @@ class Corpus:
         self.delegation_events = 0
         self.first_ts = None
         self.last_ts = None
+        self.cc_version = None          # Claude Code version off the latest event that carries one
+        self._cc_version_ts = None      # ts of that event, so a later versioned event can win
         self.active_seconds = 0.0
         # Per-session ordered timelines of {"kind": "prompt"|"tool", ...}
         self.sessions = {}              # session_id -> {"project","timeline":[...]}
@@ -751,6 +851,12 @@ def parse(files):
                     ts_in_file.append(ts)
                     c.first_ts = ts if c.first_ts is None or ts < c.first_ts else c.first_ts
                     c.last_ts = ts if c.last_ts is None or ts > c.last_ts else c.last_ts
+                # Keep the CC version off the LATEST event that actually carries one — ~28% of
+                # events have no `version`, so reading the max-ts event would often miss it.
+                v = e.get("version")
+                if v and (c._cc_version_ts is None or (ts is not None and ts >= c._cc_version_ts)):
+                    c.cc_version = v
+                    c._cc_version_ts = ts if ts is not None else c._cc_version_ts
                 msg = e.get("message") if isinstance(e.get("message"), dict) else {}
                 role = e.get("role") or msg.get("role") or e.get("type")
                 content = msg.get("content", e.get("content"))
@@ -1377,6 +1483,18 @@ _ADOPTION_LABEL = {
 }
 
 
+def _outdated_badge(state):
+    """An 'update available · vX → vY' badge when `state["outdated"]` is True; '' otherwise.
+
+    Renders no version claim when outdated is None (unknown) or False (current) — the report
+    never asserts up-to-date / outdated unless the versions actually compared as behind."""
+    if not isinstance(state, dict) or state.get("outdated") is not True:
+        return ""
+    iv = state.get("installed_version") or "?"
+    lv = state.get("latest_version") or "?"
+    return f'<span class="tag w">update available · v{_esc(iv)} → v{_esc(lv)}</span>'
+
+
 def _usage_section_html(usage, adoption, span_days):
     """One combined 'Usage & Adoption' section, mirroring _analysis_section_html.
 
@@ -1429,10 +1547,13 @@ def _usage_section_html(usage, adoption, span_days):
                      f'<div class="bv">{p:.0f}%</div></div>')
         parts.append(f'<p class="def" style="margin-top:14px">Work-type mix {_esc(span)}:</p>{bars}')
 
-    # --- Adoption -------------------------------------------------------------------
+    # --- Adoption: two sub-sections --------------------------------------------------
     if adoption:
-        parts.append('<p class="def" style="margin-top:14px">Crabi-tool adoption:</p>')
-        for target, state in adoption.items():
+        # (1) Crabi suggested plugins — the named-tool targets as aggregate badge rows.
+        parts.append('<p class="def" style="margin-top:18px">'
+                     '<b>Crabi suggested plugins</b> — the tools we recommend leaning on:</p>')
+        for target in SIGNATURES:
+            state = adoption.get(target)
             if not isinstance(state, dict):
                 continue
             label = _ADOPTION_LABEL.get(target, target)
@@ -1450,31 +1571,45 @@ def _usage_section_html(usage, adoption, span_days):
             # The coaching signal: installed but never invoked.
             if installed and not used:
                 badges.append('<span class="tag w">never used</span>')
-            else:
+            elif used:
                 badges.append(f'<span class="tag ld">used {used:,}×</span>')
+            badges.append(_outdated_badge(state))
             unused = installed and not used
             row_cls = ' style="border-left:4px solid var(--warn)"' if unused else ""
-            # Per-plugin breakdown for the marketplace target: which plugins are used vs idle.
-            bd = state.get("plugin_breakdown") or []
-            bd_html = ""
-            if bd:
-                used_p = sorted((p for p in bd if p.get("used")), key=lambda x: -x["used"])
-                idle_p = [p for p in bd if not p.get("used")]
-                if used_p:
-                    chips = " ".join(f'<span class="tag s">{_esc(p["name"])} {p["used"]:,}×</span>'
-                                     for p in used_p)
-                    bd_html += f'<p class="rate">Used: {chips}</p>'
-                if idle_p:
-                    chips = " ".join(f'<span class="tag w">{_esc(p["name"])}</span>' for p in idle_p)
-                    bd_html += (f'<p class="rate">Never used ({len(idle_p)} of {len(bd)}): '
-                                f'{chips} — installed but idle.</p>')
             parts.append(
                 f'<div class="dim"{row_cls}><div class="top">'
-                f'<span class="name">{_esc(label)} {"".join(badges)}</span></div>'
+                f'<span class="name">{_esc(label)} {"".join(b for b in badges if b)}</span></div>'
                 + ('<p class="rate">Installed but never used — a tool you could lean on.</p>'
-                   if unused else "")
-                + bd_html
+                   if unused else
+                   ('<p class="rate">Not installed — install it to unlock this workflow.</p>'
+                    if not installed else ""))
                 + '</div>')
+
+        # (2) Crabi AI marketplace — every catalog plugin, status + outdated marker.
+        crabi = adoption.get(CRABI_REPO)
+        bd = (crabi.get("plugin_breakdown") if isinstance(crabi, dict) else None) or []
+        if bd:
+            parts.append('<p class="def" style="margin-top:18px">'
+                         '<b>Crabi AI marketplace</b> — every plugin in the catalog:</p>')
+            for p in sorted(bd, key=lambda x: (not x.get("installed"), -x.get("used", 0), x["name"])):
+                p_installed = p.get("installed")
+                p_used = p.get("used", 0)
+                if not p_installed:
+                    status = '<span class="tag ld">not installed</span>'
+                    note = "not installed"
+                elif p_used:
+                    status = f'<span class="tag s">installed · used {p_used:,}×</span>'
+                    note = ""
+                else:
+                    status = '<span class="tag w">installed · idle</span>'
+                    note = "installed but idle"
+                out_badge = _outdated_badge(p)
+                row_cls = ' style="border-left:4px solid var(--warn)"' if (p_installed and not p_used) else ""
+                parts.append(
+                    f'<div class="dim"{row_cls}><div class="top">'
+                    f'<span class="name">{_esc(p["name"])} {status}{out_badge}</span></div>'
+                    + (f'<p class="rate">{_esc(note)}</p>' if note else "")
+                    + '</div>')
 
     parts.append('<p style="color:var(--mut);font-size:13px;margin-top:10px">'
                  'Raw counts over your real measured window — not normalized. Adoption is read '
@@ -1624,7 +1759,10 @@ def build_assessment(corpus, result, cards):
 
 
 def build_html(corpus, result, cards, strength, archive_info=None, analysis=None, analysis_note=None,
-               usage=None, adoption=None):
+               usage=None, adoption=None, generated_at=None):
+    # Testability seam: tests pass a fixed datetime; the real run defaults to now.
+    # (Phase 2 renders it; Phase 1 only threads it.)
+    generated_at = generated_at or datetime.now()
     a = result["archetype"]
     d = result["dist"]
     analysis_section = _analysis_section_html(analysis)
@@ -1682,10 +1820,14 @@ def build_html(corpus, result, cards, strength, archive_info=None, analysis=None
         elif name == cards[0]["dim"]:
             tag = '<span class="tag w">Top growth lever</span>'
         ld = '<span class="tag ld">low data</span>' if lowdata else ""
+        # Quality tier drives the fill color (blue high / violet mid / orange low) — a
+        # colorblind-safe ramp that rides alongside the bar length, the /100 number and
+        # the text tag, so quality is never read from color alone.
+        fill_cls = "" if sc >= 60 else ("mid" if sc >= 40 else "lo")
         dim_html += f"""
       <div class="dim">
         <div class="top"><span class="name">{_esc(disp(name))} {tag}{ld}</span><span class="sval">{sc}<span class="hint">/100</span></span></div>
-        <div class="bar"><i style="width:{sc}%"></i></div>
+        <div class="bar"><i class="{fill_cls}" style="width:{sc}%"></i></div>
         <p class="def">{_esc(DIM_BLURB[name])}</p>
         <p class="rate">{_esc(dim_rate_line(name))}<span class="wt"> · weight {int(WEIGHTS[name]*100)}%</span></p>
       </div>"""
@@ -1795,6 +1937,15 @@ def build_html(corpus, result, cards, strength, archive_info=None, analysis=None
         arch_hedge = ('<p style="margin-top:8px;font-size:12.5px;color:var(--warn)">Provisional — based on only '
                       f'{len(corpus.real_prompts)} prompt(s); the archetype can shift as more history accumulates.</p>')
 
+    # Header provenance meta line: evaluated date + CC version always render; the activity
+    # window is guarded so a timestamp-less corpus never formats a None date (Desired-End-State #4).
+    meta_bits = [f"Evaluated {generated_at:%Y-%m-%d}",
+                 f"Claude Code v{_esc(corpus.cc_version) if corpus.cc_version else '—'}"]
+    if corpus.first_ts and corpus.last_ts:
+        meta_bits.append(
+            f"activity {corpus.first_ts:%Y-%m-%d} → {corpus.last_ts:%Y-%m-%d} ({days} days)")
+    meta_line = '<p class="meta">' + " · ".join(meta_bits) + "</p>"
+
     # fun facts
     facts = [
         f"{len(corpus.real_prompts)} prompts you actually typed (out of {corpus.user_records:,} user records — the rest were tool output, subagent turns or system text)",
@@ -1825,90 +1976,104 @@ def build_html(corpus, result, cards, strength, archive_info=None, analysis=None
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Your AI Fluency Report</title>
 <style>
-:root{{--bg:#0c0d18;--p:#15172a;--p2:#1d2040;--ink:#eef0ff;--mut:#a4a8cc;--line:#2a2d52;
---ac:#7c5cff;--ac2:#3ad6c9;--good:#3ad68a;--warn:#ffb454;--bad:#ff6b8b;}}
+:root{{--bg:#121214;--p:#1b1b1f;--p2:#232329;--ink:#ededf2;--mut:#aab0c2;--line:#34343d;
+--ac:#7c5cff;--ac2:#3ad6c9;--ac-soft:#a99bff;--ac2-soft:#5fd6c9;
+--q-hi:#7fb2ff;--q-lo:#f0a35e;--warn:#ffb454;
+/* 8-pt spacing scale */
+--s1:8px;--s2:16px;--s3:24px;--s4:32px;}}
 *{{box-sizing:border-box;margin:0;padding:0}}
-body{{background:radial-gradient(1100px 640px at 72% -12%,#262a55 0%,var(--bg) 55%);color:var(--ink);
-font:16px/1.65 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;padding-bottom:80px}}
-.wrap{{max-width:880px;margin:0 auto;padding:0 22px}}
-header{{text-align:center;padding:60px 0 12px}}
+body{{background:var(--bg);color:var(--ink);
+font:16px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;padding-bottom:80px}}
+.wrap{{max-width:880px;margin:0 auto;padding:0 var(--s3)}}
+header{{text-align:center;padding:64px 0 var(--s2)}}
 .kick{{letter-spacing:.22em;text-transform:uppercase;font-size:12px;color:var(--mut)}}
-h1{{font-size:34px;margin:10px 0 4px}}
-.sub{{color:var(--mut);max-width:620px;margin:6px auto 0;font-size:15px}}
-.hero{{margin:30px auto 0;display:flex;gap:22px;align-items:stretch;flex-wrap:wrap;justify-content:center}}
-.score-card{{background:linear-gradient(135deg,var(--p2),var(--p));border:1px solid var(--line);border-radius:22px;
-padding:26px 30px;text-align:center;min-width:240px;box-shadow:0 18px 50px rgba(0,0,0,.4)}}
+h1{{font-size:34px;line-height:1.15;margin:var(--s1) 0 4px;font-weight:800}}
+.sub{{color:var(--mut);max-width:620px;margin:var(--s1) auto 0;font-size:15px}}
+.meta{{color:var(--mut);font-size:13px;margin:var(--s2) auto 0;letter-spacing:.02em}}
+.hero{{margin:var(--s4) auto 0;display:flex;gap:var(--s2);align-items:stretch;flex-wrap:wrap;justify-content:center}}
+.score-card{{background:var(--p2);border:1px solid var(--line);border-radius:18px;
+padding:var(--s3) var(--s4);text-align:center;min-width:240px}}
 .ring{{position:relative;width:170px;height:170px;margin:0 auto}}
 .ring .n{{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center}}
-.ring .n b{{font-size:50px;line-height:1}}
+.ring .n b{{font-size:54px;line-height:1;font-weight:800}}
 .ring .n s{{text-decoration:none;color:var(--mut);font-size:13px}}
-.band{{margin-top:12px;font-size:19px;font-weight:700;color:var(--ac2)}}
+.band{{margin-top:var(--s2);font-size:19px;font-weight:700;color:var(--ac2-soft)}}
 .rawnote{{color:var(--mut);font-size:12px;margin-top:4px}}
-.arch{{flex:1;min-width:260px;background:var(--p);border:1px solid var(--line);border-radius:22px;padding:24px 26px;text-align:left}}
+.arch{{flex:1;min-width:260px;background:var(--p);border:1px solid var(--line);border-radius:18px;padding:var(--s3);text-align:left}}
 .arch .emoji{{font-size:40px}}
-.arch h2{{font-size:23px;margin:6px 0}}
+.arch h2{{font-size:23px;margin:6px 0;font-weight:700}}
 .arch p{{color:var(--mut);font-size:15px}}
-.prov{{background:rgba(255,180,84,.1);border:1px solid rgba(255,180,84,.35);color:#ffe6c2;border-radius:12px;padding:12px 16px;margin:22px 0 0;font-size:14px}}
-section{{margin:42px 0}}
-h3{{font-size:13px;letter-spacing:.16em;text-transform:uppercase;color:var(--mut);border-bottom:1px solid var(--line);padding-bottom:10px;margin-bottom:18px}}
-.band-meaning{{background:var(--p);border:1px solid var(--line);border-left:4px solid var(--ac);border-radius:12px;padding:16px 20px;color:#dfe2ff}}
-.assess{{background:var(--p);border:1px solid var(--line);border-radius:14px;padding:16px 20px;margin-bottom:12px;font-size:15.5px;line-height:1.7;color:#e8eaff}}
+.prov{{background:rgba(255,180,84,.08);border:1px solid rgba(255,180,84,.32);color:#ffe6c2;border-radius:10px;padding:12px var(--s2);margin:var(--s3) 0 0;font-size:14px}}
+section{{margin:var(--s4) 0}}
+h3{{font-size:13px;letter-spacing:.16em;text-transform:uppercase;color:var(--mut);border-bottom:1px solid var(--line);padding-bottom:10px;margin-bottom:var(--s3);font-weight:700}}
+.band-meaning{{background:var(--p);border:1px solid var(--line);border-left:3px solid var(--ac-soft);border-radius:10px;padding:var(--s2) var(--s3);color:var(--ink)}}
+.assess{{background:var(--p);border:1px solid var(--line);border-radius:12px;padding:var(--s2) var(--s3);margin-bottom:var(--s1);font-size:15.5px;line-height:1.6;color:var(--ink)}}
 .assess b{{color:#fff}}
-.ingest{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}}
-.ing{{background:var(--p);border:1px solid var(--line);border-radius:14px;padding:14px 16px}}
-.ing .n{{font-size:24px;font-weight:700;color:var(--ac2)}}
+.ingest{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:var(--s1)}}
+.ing{{background:var(--p);border:1px solid var(--line);border-radius:12px;padding:var(--s2)}}
+.ing .n{{font-size:24px;font-weight:700;color:var(--ac2-soft)}}
 .ing .l{{color:var(--mut);font-size:13px;margin-top:2px}}
-.honesty{{margin-top:16px;background:var(--p);border:1px solid var(--line);border-radius:14px;padding:16px 20px}}
+.honesty{{margin-top:var(--s2);background:var(--p);border:1px solid var(--line);border-radius:12px;padding:var(--s2) var(--s3)}}
 .honesty b{{color:var(--ink)}}
-.honesty ul{{list-style:none;display:flex;flex-wrap:wrap;gap:8px 22px;margin-top:8px}}
+.honesty ul{{list-style:none;display:flex;flex-wrap:wrap;gap:var(--s1) var(--s3);margin-top:var(--s1)}}
 .honesty li{{color:var(--mut);font-size:14px}}
-.dim{{background:var(--p);border:1px solid var(--line);border-radius:14px;padding:16px 20px;margin-bottom:12px}}
+.dim{{background:var(--p);border:1px solid var(--line);border-radius:12px;padding:var(--s2) var(--s3);margin-bottom:var(--s1)}}
 .dim .top{{display:flex;justify-content:space-between;align-items:baseline}}
 .dim .name{{font-weight:700;font-size:17px}}
 .dim .sval{{font-size:22px;font-weight:800}} .dim .hint{{color:var(--mut);font-size:12px;font-weight:400}}
 .dim-h{{display:flex;justify-content:space-between;align-items:baseline;gap:12px;margin-bottom:6px}}
 .dim-h b{{font-size:17px}}
 .pill{{font-size:12px;font-weight:700;color:var(--ink);background:var(--p2);border:1px solid var(--line);border-radius:99px;padding:3px 11px;white-space:nowrap}}
-.ev{{margin:8px 0 0 0;padding-left:18px}} .ev li{{color:var(--mut);font-size:14px;margin:3px 0}}
-.next{{margin-top:8px;font-size:14.5px}} .next b{{color:#fff}}
-.bar{{height:9px;background:#23264a;border-radius:99px;overflow:hidden;margin:11px 0 9px}}
-.bar>i{{display:block;height:100%;border-radius:99px;background:linear-gradient(90deg,var(--ac),var(--ac2))}}
+.ev{{margin:var(--s1) 0 0 0;padding-left:18px}} .ev li{{color:var(--mut);font-size:14px;margin:3px 0}}
+.next{{margin-top:var(--s1);font-size:14.5px}} .next b{{color:#fff}}
+/* Bullet-graph dimension bar: faint quality band behind a flat sequential fill + a target tick.
+   Quality is encoded by FILL LENGTH + a per-dimension text label (.tag), never color alone. */
+.bar{{position:relative;height:10px;background:var(--p2);border-radius:3px;overflow:hidden;margin:11px 0 9px}}
+.bar::before{{content:"";position:absolute;left:0;top:0;bottom:0;width:55%;background:rgba(127,178,255,.08)}}
+.bar::after{{content:"";position:absolute;left:60%;top:-2px;bottom:-2px;width:2px;background:var(--mut);opacity:.55}}
+.bar>i{{display:block;height:100%;border-radius:3px;background:var(--q-hi);position:relative;z-index:1}}
+.bar>i.lo{{background:var(--q-lo)}} .bar>i.mid{{background:var(--ac-soft)}}
 .def{{color:var(--ink);font-size:14.5px}} .rate{{color:var(--mut);font-size:13px;margin-top:3px}} .wt{{opacity:.7}}
-.tag{{font-size:10.5px;padding:2px 8px;border-radius:99px;font-weight:700;margin-left:6px;vertical-align:middle}}
-.tag.s{{background:rgba(58,214,138,.16);color:var(--good)}} .tag.w{{background:rgba(255,107,139,.16);color:var(--bad)}}
-.tag.ld{{background:rgba(164,168,204,.16);color:var(--mut)}}
-.bar-item{{display:flex;align-items:center;gap:12px;margin:7px 0}}
-.bl{{min-width:160px;font-size:14px}} .bt{{flex:1;height:7px;background:#23264a;border-radius:99px;overflow:hidden}}
-.bt>i{{display:block;height:100%;background:linear-gradient(90deg,var(--ac),var(--ac2))}} .bv{{min-width:46px;text-align:right;color:var(--mut);font-size:13px}}
-.card{{background:var(--p);border:1px solid var(--line);border-radius:16px;padding:18px 22px;margin-bottom:14px}}
-.prio{{border-left:4px solid var(--warn)}} .keep{{border-left:4px solid var(--good)}}
+.tag{{font-size:10.5px;padding:2px 8px;border-radius:6px;font-weight:700;margin-left:6px;vertical-align:middle;border:1px solid transparent}}
+.tag.s{{background:rgba(127,178,255,.14);color:var(--q-hi);border-color:rgba(127,178,255,.3)}}
+.tag.w{{background:rgba(240,163,94,.14);color:var(--q-lo);border-color:rgba(240,163,94,.3)}}
+.tag.ld{{background:rgba(170,176,194,.12);color:var(--mut);border-color:rgba(170,176,194,.26)}}
+.bar-item{{display:flex;align-items:center;gap:var(--s2);margin:7px 0}}
+.bl{{min-width:160px;font-size:14px}} .bt{{flex:1;height:8px;background:var(--p2);border-radius:3px;overflow:hidden}}
+.bt>i{{display:block;height:100%;background:var(--ac2-soft)}} .bv{{min-width:46px;text-align:right;color:var(--mut);font-size:13px}}
+.card{{background:var(--p);border:1px solid var(--line);border-radius:12px;padding:var(--s3);margin-bottom:var(--s2)}}
+.prio{{border-left:3px solid var(--q-lo)}} .keep{{border-left:3px solid var(--q-hi)}}
 .ph{{font-size:12px;text-transform:uppercase;letter-spacing:.1em;color:var(--mut)}}
-.pscore{{float:right;color:var(--ac2);letter-spacing:0}}
-.card h4{{font-size:18px;margin:8px 0 12px}}
-.wwh{{margin:12px 0}} .wwh .lab{{display:block;font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--mut);margin-bottom:6px}}
-ul.ev{{list-style:none}} ul.ev li{{background:var(--p2);border-radius:9px;padding:9px 12px;margin-bottom:7px;font-size:14px}}
-.loc{{color:var(--mut);font-size:12.5px}} .ev-none{{color:var(--good);font-size:14px}}
-.ba{{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:8px}}
+.pscore{{float:right;color:var(--ac2-soft);letter-spacing:0}}
+.card h4{{font-size:18px;margin:var(--s1) 0 12px;font-weight:700}}
+.wwh{{margin:var(--s2) 0}} .wwh .lab{{display:block;font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--mut);margin-bottom:6px}}
+ul.ev{{list-style:none}} ul.ev li{{background:var(--p2);border-radius:8px;padding:9px 12px;margin-bottom:7px;font-size:14px}}
+.loc{{color:var(--mut);font-size:12.5px}} .ev-none{{color:var(--q-hi);font-size:14px}}
+.ba{{display:grid;grid-template-columns:1fr 1fr;gap:var(--s1);margin-top:var(--s1)}}
 .why{{color:var(--mut);font-size:14px;margin:2px 0 4px}} .why b{{color:var(--ink)}}
 .how{{font-size:14.5px;margin:0 0 4px}}
-.exgen{{font-size:12px;color:var(--mut);margin:8px 0 2px;font-style:italic}}
+.exgen{{font-size:12px;color:var(--mut);margin:var(--s1) 0 2px;font-style:italic}}
 .sk-what{{color:var(--ink);font-size:13.5px;margin-top:5px}}
-.lvl{{font-size:11px;color:var(--ac2);font-weight:600;margin-left:6px}}
-.before,.after{{border-radius:10px;padding:10px 13px;font-size:14px}}
-.before{{background:rgba(255,107,139,.08);color:#ffd0da}} .after{{background:rgba(58,214,138,.08);color:#cfeede}}
-.before span,.after span{{display:block;font-size:11px;text-transform:uppercase;letter-spacing:.08em;opacity:.7;margin-bottom:3px}}
-.tgt{{margin-top:10px;color:var(--ac2);font-size:14px}}
-.skill{{background:var(--p);border:1px solid var(--line);border-radius:14px;padding:14px 18px;margin-bottom:10px}}
+.lvl{{font-size:11px;color:var(--ac2-soft);font-weight:600;margin-left:6px}}
+/* before/after teaching pairs: quality read from the label ("Instead of" / "Stronger"),
+   not red/green fills — a neutral well + a positive blue accent, colorblind-safe. */
+.before,.after{{border-radius:8px;padding:10px 13px;font-size:14px}}
+.before{{background:var(--p2);color:var(--ink)}}
+.after{{background:rgba(127,178,255,.08);color:var(--ink);border-left:2px solid var(--q-hi)}}
+.before span,.after span{{display:block;font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--mut);margin-bottom:3px}}
+.after span{{color:var(--q-hi)}}
+.tgt{{margin-top:var(--s1);color:var(--ac2-soft);font-size:14px}}
+.skill{{background:var(--p);border:1px solid var(--line);border-radius:12px;padding:var(--s2) var(--s3);margin-bottom:var(--s1)}}
 .sk-top{{display:flex;justify-content:space-between;align-items:center}} .sk-name{{font-weight:700}}
-.dot{{display:inline-block;width:11px;height:11px;border-radius:50%;background:#2a2d52;margin-left:4px}}
-.dot.on{{background:linear-gradient(135deg,var(--ac),var(--ac2))}}
+.dot{{display:inline-block;width:11px;height:11px;border-radius:50%;background:var(--p2);border:1px solid var(--line);margin-left:4px}}
+.dot.on{{background:var(--ac-soft);border-color:var(--ac-soft)}}
 .sk-now{{color:var(--mut);font-size:13.5px;margin-top:6px}} .sk-next{{font-size:13.5px;margin-top:3px}}
-.facts{{list-style:none}} .facts li{{background:var(--p);border:1px solid var(--line);border-radius:10px;padding:11px 15px;margin-bottom:8px;font-size:14.5px}}
-.facts li::before{{content:"›";color:var(--ac2);font-weight:800;margin-right:9px}}
-details{{background:var(--p);border:1px solid var(--line);border-radius:12px;padding:14px 18px;margin-top:14px}}
-summary{{cursor:pointer;color:var(--mut);font-size:14px}} details p,details li{{color:var(--mut);font-size:13px;margin-top:8px}}
-footer{{text-align:center;color:var(--mut);font-size:13px;margin-top:46px}}
-code{{background:#23264a;padding:1px 6px;border-radius:5px;font-size:13px}}
+.facts{{list-style:none}} .facts li{{background:var(--p);border:1px solid var(--line);border-radius:8px;padding:11px 15px;margin-bottom:var(--s1);font-size:14.5px}}
+.facts li::before{{content:"›";color:var(--ac2-soft);font-weight:800;margin-right:9px}}
+details{{background:var(--p);border:1px solid var(--line);border-radius:12px;padding:var(--s2) var(--s3);margin-top:var(--s2)}}
+summary{{cursor:pointer;color:var(--mut);font-size:14px}} details p,details li{{color:var(--mut);font-size:13px;margin-top:var(--s1)}}
+footer{{text-align:center;color:var(--mut);font-size:13px;margin-top:var(--s4)}}
+code{{background:var(--p2);padding:1px 6px;border-radius:5px;font-size:13px}}
 @media(max-width:640px){{.ba{{grid-template-columns:1fr}}.bl{{min-width:120px}}}}
 </style></head><body><div class="wrap">
 
@@ -1944,30 +2109,15 @@ code{{background:#23264a;padding:1px 6px;border-radius:5px;font-size:13px}}
   </div>
 </div>
 
+<!-- ===== Group 1 · The verdict — "How did I do?" ===== -->
+<div class="band-meaning" style="margin-top:22px"><b>{_esc(result['band'])} ({result['overall']}/100).</b> {_esc(result['band_meaning'])}</div>
+{meta_line}
+
+<!-- ===== Group 2 · The breakdown — "Why?" ===== -->
 <section>
   <h3>Professional assessment</h3>
   {assessment_html}
 </section>
-
-<section>
-  <h3>What your score means</h3>
-  <div class="band-meaning"><b>{_esc(result['band'])} ({result['overall']}/100).</b> {_esc(result['band_meaning'])}</div>
-</section>
-
-<section>
-  <h3>How much data this is based on</h3>
-  <div class="ingest">
-    <div class="ing"><div class="n">{corpus.files}</div><div class="l">sessions scanned</div></div>
-    <div class="ing"><div class="n">{len(corpus.projects)}</div><div class="l">projects</div></div>
-    <div class="ing"><div class="n">{corpus.total_bytes/1e6:.1f} MB</div><div class="l">transcript data parsed</div></div>
-    <div class="ing"><div class="n">{days} days</div><div class="l">span of activity</div></div>
-    <div class="ing"><div class="n">{len(corpus.real_prompts)}</div><div class="l">real prompts you typed</div></div>
-    <div class="ing"><div class="n">{active_h:.0f} h</div><div class="l">hands-on active time</div></div>
-    {archive_tile}
-  </div>
-</section>
-
-{usage_section}
 
 {analysis_section}
 {analysis_status_html}
@@ -1977,29 +2127,49 @@ code{{background:#23264a;padding:1px 6px;border-radius:5px;font-size:13px}}
   {dim_html}
 </section>
 
+<!-- ===== Group 3 · Strengths & standing — "Where do I stand?" ===== -->
+<section>
+  <h3>Where you stand</h3>
+  {strength_html}
+  {skill_html}
+  <details>
+    <summary>Archetype affinity — how close you are to each builder style</summary>
+    {aff}
+  </details>
+</section>
+
+<!-- ===== Group 4 · What to do next — "What now?" ===== -->
 <section>
   <h3>What to improve — and exactly how</h3>
   {improve_intro}
   {improve_cards}
-  {strength_html}
 </section>
 
-<section>
-  <h3>Your skill map</h3>
-  {skill_html}
-</section>
+<!-- ===== Group 5 · Trust & method — "Can I believe it?" ===== -->
+<details>
+  <summary>Trust &amp; method — the data, your tool adoption, and the honest numbers</summary>
+  <section>
+    <h3>How much data this is based on</h3>
+    <div class="ingest">
+      <div class="ing"><div class="n">{corpus.files}</div><div class="l">sessions scanned</div></div>
+      <div class="ing"><div class="n">{len(corpus.projects)}</div><div class="l">projects</div></div>
+      <div class="ing"><div class="n">{corpus.total_bytes/1e6:.1f} MB</div><div class="l">transcript data parsed</div></div>
+      <div class="ing"><div class="n">{days} days</div><div class="l">span of activity</div></div>
+      <div class="ing"><div class="n">{len(corpus.real_prompts)}</div><div class="l">real prompts you typed</div></div>
+      <div class="ing"><div class="n">{active_h:.0f} h</div><div class="l">hands-on active time</div></div>
+      {archive_tile}
+    </div>
+  </section>
 
-<section>
-  <h3>Archetype affinity</h3>
-  {aff}
-</section>
+  {usage_section}
 
-<section>
-  <h3>Honest numbers at a glance</h3>
-  <ul class="facts">{facts_html}</ul>
-</section>
+  <section>
+    <h3>Honest numbers at a glance</h3>
+    <ul class="facts">{facts_html}</ul>
+  </section>
+</details>
 
-<footer>Generated locally by Claude Insight v2 · your transcripts never left this machine.</footer>
+<footer>Generated locally by Claude Insight v2 · evaluated {generated_at:%Y-%m-%d} · Claude Code v{_esc(corpus.cc_version) if corpus.cc_version else '—'} · your transcripts never left this machine.</footer>
 </div></body></html>"""
 
 
@@ -2183,6 +2353,7 @@ def main(argv=None):
             "band": result["band"], "archetype": result["archetype"]["label"],
             "dimensions_raw": result["raw"], "dimensions_adjusted": result["shrunk"],
             "confidence": result["conf"], "detail": result["detail"],
+            "cc_version": corpus.cc_version,
             "data_ingested": {
                 "files": corpus.files, "projects": len(corpus.projects),
                 "bytes": corpus.total_bytes, "user_records": corpus.user_records,
@@ -2191,6 +2362,7 @@ def main(argv=None):
                 "prompt_distribution": result["dist"],
                 "archive": archive_info,
             },
+            "adoption": build_adoption(corpus),
         }
         print(json.dumps(payload, indent=2))
         return 0
