@@ -435,6 +435,12 @@ SIGNATURES = {
         "plugin_id": "desplega@desplega-ai-toolbox",
         "namespace": "desplega",
     },
+    "superpowers": {
+        # ponytail: install key is a best-effort guess — superpowers isn't installed on this
+        # machine, so this id is unverified until it shows up in installed_plugins.json.
+        "plugin_id": "superpowers@superpowers",
+        "namespace": "superpowers",
+    },
 }
 
 # The provenance key: a plugin is "Crabi-authored" iff its marketplace resolves to this repo.
@@ -511,6 +517,71 @@ def _marketplace_repo(marketplaces, name):
     return source.get("repo")
 
 
+def _version_tuple(v):
+    """Parse a dotted-int version into a tuple, or None if missing/"unknown"/unparseable."""
+    if not isinstance(v, str) or v.strip().lower() in ("", "unknown"):
+        return None
+    try:
+        return tuple(int(p) for p in v.strip().split("."))
+    except ValueError:
+        return None
+
+
+def _version_outdated(installed, latest):
+    """True/False/None — is `installed` behind `latest`?
+
+    Returns None (unknown) when either side is missing, "unknown", or unparseable, so the
+    report never makes a false up-to-date / outdated claim. ponytail: naive dotted-int
+    compare, no prerelease/semver-build handling — fine for plugin versions."""
+    iv, lv = _version_tuple(installed), _version_tuple(latest)
+    if iv is None or lv is None:
+        return None
+    return iv < lv
+
+
+def _load_marketplace_catalog(marketplace=None, repo_slug=None, claude_dir=None):
+    """{plugin_name -> latest_version|None} from a marketplace's local clone manifest.
+
+    Resolves the marketplace entry EITHER by name (direct key in known_marketplaces) OR by
+    repo slug (the entry whose source.repo == repo_slug — used for the Crabi target). Reads
+    its installLocation (fallback <root>/plugins/marketplaces/<name>) + .claude-plugin/
+    marketplace.json. Best-effort: returns {} on any miss, never raises."""
+    root = os.path.expanduser(claude_dir or "~/.claude")
+    marketplaces = _load_known_marketplaces(claude_dir)
+
+    name = marketplace
+    entry = None
+    if name is not None:
+        entry = marketplaces.get(name)
+    elif repo_slug is not None:
+        for n, e in marketplaces.items():
+            if isinstance(e, dict):
+                src = e.get("source")
+                if isinstance(src, dict) and src.get("repo") == repo_slug:
+                    name, entry = n, e
+                    break
+    if name is None:
+        return {}
+
+    install_loc = None
+    if isinstance(entry, dict):
+        loc = entry.get("installLocation")
+        if isinstance(loc, str) and loc:
+            install_loc = os.path.expanduser(loc)
+    if install_loc is None:
+        install_loc = os.path.join(root, "plugins", "marketplaces", name)
+
+    manifest = _read_json(os.path.join(install_loc, ".claude-plugin", "marketplace.json"))
+    plugins = manifest.get("plugins")
+    if not isinstance(plugins, list):
+        return {}
+    out = {}
+    for p in plugins:
+        if isinstance(p, dict) and isinstance(p.get("name"), str):
+            out[p["name"]] = p.get("version")  # may be None / "unknown"
+    return out
+
+
 def build_adoption(corpus, claude_dir=None):
     """Per-target {installed, enabled, used} from the offline provenance join + signatures.
 
@@ -539,18 +610,35 @@ def build_adoption(corpus, claude_dir=None):
         _plugin, marketplace = pid.rsplit("@", 1)
         if _marketplace_repo(marketplaces, marketplace) == CRABI_REPO:
             crabi_ids.append(pid)
-    crabi_used = 0
+    # installed crabi plugin name -> its plugin_id (to read install record / enabled flag).
+    crabi_pid_by_name = {pid.rsplit("@", 1)[0]: pid for pid in crabi_ids}
+    crabi_used = sum(_plugin_used(corpus, name) for name in crabi_pid_by_name)
+
+    # Latest versions from the local marketplace clone (best-effort; {} if missing). Build the
+    # breakdown over the UNION of catalog names + installed crabi plugins so not-installed
+    # catalog plugins still show up. Falls back to installed-only when the catalog read misses.
+    catalog = _load_marketplace_catalog(repo_slug=CRABI_REPO, claude_dir=claude_dir)
+    names = sorted(set(catalog) | set(crabi_pid_by_name))
     breakdown = []
-    for pid in sorted(crabi_ids):
-        plugin_name = pid.rsplit("@", 1)[0]
-        u = _plugin_used(corpus, plugin_name)
-        crabi_used += u
-        breakdown.append({"name": plugin_name, "used": u, "enabled": bool(enabled.get(pid))})
+    for name in names:
+        pid = crabi_pid_by_name.get(name)
+        is_inst = pid is not None
+        inst_ver = installed[pid].get("version") if is_inst else None
+        latest_ver = catalog.get(name)
+        breakdown.append({
+            "name": name,
+            "used": _plugin_used(corpus, name),
+            "enabled": (bool(enabled.get(pid)) if is_inst else None),
+            "installed": is_inst,
+            "installed_version": inst_ver,
+            "latest_version": latest_ver,
+            "outdated": _version_outdated(inst_ver, latest_ver),
+        })
     out[CRABI_REPO] = {
         "installed": bool(crabi_ids),
         "enabled": (any(enabled.get(pid) for pid in crabi_ids) if crabi_ids else None),
         "used": crabi_used,
-        "plugins": sorted(p.rsplit("@", 1)[0] for p in crabi_ids),
+        "plugins": sorted(crabi_pid_by_name),
         "plugin_breakdown": breakdown,   # per-plugin used / never-used (multi-channel)
     }
 
@@ -570,10 +658,20 @@ def build_adoption(corpus, claude_dir=None):
         cmd_rx = sig.get("cmd_regex")
         if cmd_rx is not None:
             used += _cmd_used(corpus, cmd_rx)
+        # Per-tool version + outdated marker. installed_version comes off the install record;
+        # latest comes from the tool's marketplace clone, resolved by NAME (a suggested tool
+        # only knows its marketplace name — the plugin_id suffix — not a repo slug).
+        installed_version = installed[pid].get("version") if is_installed else None
+        mkt_name = pid.rsplit("@", 1)[1] if "@" in pid else None
+        latest_version = _load_marketplace_catalog(
+            marketplace=mkt_name, claude_dir=claude_dir).get(target) if mkt_name else None
         out[target] = {
             "installed": is_installed,
             "enabled": (bool(enabled.get(pid)) if is_installed else None),
             "used": used,
+            "installed_version": installed_version,
+            "latest_version": latest_version,
+            "outdated": _version_outdated(installed_version, latest_version),
         }
 
     return out
@@ -614,6 +712,8 @@ class Corpus:
         self.delegation_events = 0
         self.first_ts = None
         self.last_ts = None
+        self.cc_version = None          # Claude Code version off the latest event that carries one
+        self._cc_version_ts = None      # ts of that event, so a later versioned event can win
         self.active_seconds = 0.0
         # Per-session ordered timelines of {"kind": "prompt"|"tool", ...}
         self.sessions = {}              # session_id -> {"project","timeline":[...]}
@@ -751,6 +851,12 @@ def parse(files):
                     ts_in_file.append(ts)
                     c.first_ts = ts if c.first_ts is None or ts < c.first_ts else c.first_ts
                     c.last_ts = ts if c.last_ts is None or ts > c.last_ts else c.last_ts
+                # Keep the CC version off the LATEST event that actually carries one — ~28% of
+                # events have no `version`, so reading the max-ts event would often miss it.
+                v = e.get("version")
+                if v and (c._cc_version_ts is None or (ts is not None and ts >= c._cc_version_ts)):
+                    c.cc_version = v
+                    c._cc_version_ts = ts if ts is not None else c._cc_version_ts
                 msg = e.get("message") if isinstance(e.get("message"), dict) else {}
                 role = e.get("role") or msg.get("role") or e.get("type")
                 content = msg.get("content", e.get("content"))
@@ -1624,7 +1730,10 @@ def build_assessment(corpus, result, cards):
 
 
 def build_html(corpus, result, cards, strength, archive_info=None, analysis=None, analysis_note=None,
-               usage=None, adoption=None):
+               usage=None, adoption=None, generated_at=None):
+    # Testability seam: tests pass a fixed datetime; the real run defaults to now.
+    # (Phase 2 renders it; Phase 1 only threads it.)
+    generated_at = generated_at or datetime.now()
     a = result["archetype"]
     d = result["dist"]
     analysis_section = _analysis_section_html(analysis)
@@ -2183,6 +2292,7 @@ def main(argv=None):
             "band": result["band"], "archetype": result["archetype"]["label"],
             "dimensions_raw": result["raw"], "dimensions_adjusted": result["shrunk"],
             "confidence": result["conf"], "detail": result["detail"],
+            "cc_version": corpus.cc_version,
             "data_ingested": {
                 "files": corpus.files, "projects": len(corpus.projects),
                 "bytes": corpus.total_bytes, "user_records": corpus.user_records,
@@ -2191,6 +2301,7 @@ def main(argv=None):
                 "prompt_distribution": result["dist"],
                 "archive": archive_info,
             },
+            "adoption": build_adoption(corpus),
         }
         print(json.dumps(payload, indent=2))
         return 0
