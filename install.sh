@@ -22,8 +22,10 @@ echo "✅ python3 found"
 
 # Resolve the latest *tagged release* so a work-in-progress commit on main can
 # never break a fresh install. Fall back to main only if no release exists yet.
+# `|| true` keeps a no-release repo (grep matches nothing) from aborting the
+# script under `set -euo pipefail` before the main fallback can run.
 REF="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
-  | grep '"tag_name"' | head -1 | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')"
+  | grep '"tag_name"' | head -1 | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/' || true)"
 if [ -n "$REF" ]; then
   echo "📦 Latest release: ${REF}"
   URL="https://github.com/${REPO}/archive/refs/tags/${REF}.tar.gz"
