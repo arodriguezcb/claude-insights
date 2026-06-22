@@ -10,7 +10,7 @@ autonomy: verbose
 commit_per_phase: true
 based_on: thoughts/arodriguez/research/2026-06-21-ai-fluency-report-redesign.md
 last_updated: 2026-06-21
-last_updated_by: phase-running (Phase 3)
+last_updated_by: phase-running (Phase 4)
 ---
 
 # AI-Fluency Report Redesign + New Provenance Fields — Implementation Plan
@@ -255,12 +255,12 @@ Bring the user-facing docs in line with the redesigned report and new fields: up
 ### Success Criteria:
 
 #### Automated Verification:
-- [ ] Test suite still green (docs must not break the gate): `python3 -m unittest discover -s tests`
-- [ ] No broken relative links / stale section names in README: `grep -n "Usage & Crabi-tool adoption\|Example output\|Install in 5 seconds" README.md` returns the expected (updated) headings.
-- [ ] CHANGELOG has the new entries under Unreleased: `grep -n -A2 "## \[Unreleased\]" CHANGELOG.md`
+- [x] Test suite still green (docs must not break the gate): `python3 -m unittest discover -s tests`
+- [x] No broken relative links / stale section names in README: `grep -n "Usage & Crabi-tool adoption\|Example output\|Install in 5 seconds" README.md` returns the expected (updated) headings.
+- [x] CHANGELOG has the new entries under Unreleased: `grep -n -A2 "## \[Unreleased\]" CHANGELOG.md`
 
 #### Automated QA:
-- [ ] Render a fixture report and confirm its actual structure/fields match what the README now claims (regroup order, meta line, two adoption sub-sections); regenerate `render-full.png` from that run.
+- [x] Render a fixture report and confirm its actual structure/fields match what the README now claims (regroup order, meta line, two adoption sub-sections); regenerate `render-full.png` from that run.
 
 #### Manual Verification:
 - [ ] Read-through of the updated README: feature descriptions, example output, and the adoption section accurately describe the shipped report; the screenshot matches.

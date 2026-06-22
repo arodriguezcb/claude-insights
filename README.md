@@ -26,12 +26,19 @@ Python 3.8+ and Claude Code.
 
 ## 🚀 What you get
 
+A single self-contained HTML report, **structured score-first** in five groups that read
+top-to-bottom: **the verdict** (score + band + archetype) → **why** (assessment + skill map
++ five dimensions) → **where you stand** (strengths + L1–L5 map) → **what to do next**
+(growth levers) → **trust & method** (the data, your tool adoption, the honest numbers). A
+provenance meta line near the top records **when it was evaluated**, the **activity window**
+(`first → last (N days)`), and the **Claude Code version** that produced your transcripts.
+
 - **A fluency score (0–100)** with a band — Operator → Developing → Proficient → Advanced → Expert — and what it means.
 - **Your builder archetype** — Autonomous Agent, Architect, Debugger, Collaborator, or Sprinter — picked from *your* behavior, not from keywords.
 - **A 4-competency skill map** — **Delegation · Description · Discernment · Diligence** (the AI Fluency framework) — each placed on a 1–5 level with one concrete next move.
 - **Five measured dimensions** behind the map — Briefing, Verification, Context-setting, Iteration, Toolcraft — each a defensible rate, not a vanity count.
 - **What / Where / How** — your top growth levers, each tied to real moments in your transcripts and (when you run the full skill) a rewrite of one of *your own* prompts.
-- **Usage & Crabi-tool adoption** — how your tool time splits across work types (Build · Debug · Plan · Investigate · Shell/Ops · Delegate · Other), your most-used MCP servers and slash commands, and which marketplace plugins you actually use vs. have installed but never touched.
+- **Usage & Crabi-tool adoption** — how your tool time splits across work types (Build · Debug · Plan · Investigate · Shell/Ops · Delegate · Other), your most-used MCP servers and slash commands, and a **two-section plugin adoption** view: *Crabi suggested plugins* (engram, obsidian, ponytail, desplega, superpowers) and the *Crabi AI marketplace* (every catalog plugin) — each tagged not-installed / installed-idle / installed-used, with an **outdated** marker when your installed version trails the latest in your local marketplace clone.
 - **Honest data accounting** — how many real prompts you typed, projects, MB, and hands-on time — across **more than the 30 days Claude Code keeps on disk** (see below).
 
 ## 🎯 How the score works (and what it won't do)
@@ -159,11 +166,14 @@ python3 insight.py                 # analyze ~/.claude/projects, then write + op
   Report: ai_fluency_report.html
 ```
 
-*(Illustrative — your numbers will differ.)* The HTML report adds the headline score ring,
-the four-competency skill map (your level and next move for each), the five dimensions,
-your top growth levers with before/after rewrites, archetype affinity, a Usage &
-Crabi-tool adoption section (work-type mix, MCP / slash-command usage, and per-plugin
-adoption), and a "how much data this is based on" breakdown.
+*(Illustrative — your numbers will differ.)* The HTML report opens score-first and flows
+through five groups: a headline score ring + band + archetype (with the evaluated date,
+activity window, and Claude Code version on a meta line just below the title), then the
+assessment and four-competency skill map (your level and next move for each) and the five
+dimensions, then where you stand (strengths + L1–L5 map + archetype affinity), then your
+top growth levers with before/after rewrites, and finally a collapsible "trust & method"
+group holding the data accounting, the two-section Usage & Crabi-tool adoption view, and
+the honest numbers.
 
 ## 🏗️ Architecture
 
@@ -207,10 +217,20 @@ changes the scoring):
   Other. Prompts are excluded — this measures actions, not chat.
 - **MCP & slash-command usage** — your most-called MCP servers (grouped, plugin infix
   stripped) and top slash commands over the measured window.
-- **Crabi marketplace adoption** — for each installed plugin, whether it's installed,
-  enabled, and actually *used*, with a per-plugin breakdown (counted across slash-command,
-  MCP, and sub-agent channels) that flags tools you have on hand but never reach for. Read
-  live and offline from your local plugin config — nothing leaves your machine.
+- **Crabi plugin adoption** — two sub-sections, read live and offline from your local
+  plugin config (nothing leaves your machine):
+  - **Crabi suggested plugins** — the tools we recommend leaning on (engram, obsidian,
+    ponytail, desplega, superpowers) as aggregate rows: installed / enabled / used, flagging
+    any that are installed but never reached for (and superpowers as not-installed until you
+    add it).
+  - **Crabi AI marketplace** — *every* plugin in the catalog (not just the ones you have),
+    each tagged **not installed** / **installed · idle** / **installed · used N×**, with
+    usage counted across slash-command, MCP, and sub-agent channels.
+  - Either list also shows an **outdated** marker (`update available · vX → vY`) when your
+    installed version trails the latest the catalog offers. "Latest" is your **local
+    marketplace clone's** version — only as fresh as your last marketplace sync — so it's an
+    offline, honest comparison, not a live upstream check. When versions can't be compared
+    (missing or `unknown`), no version claim is made.
 
 ### Archetypes (from *your* behavior, not keywords)
 - **🤖 Autonomous Agent** — delegates whole, end-to-end jobs and trusts the agent to run them.
