@@ -2,11 +2,11 @@
 set -euo pipefail
 
 # Claude Insight — installs the /ai-fluency skill into Claude Code.
-# Usage: curl -fsSL https://raw.githubusercontent.com/Feloguarin/claude-insight/main/install.sh | bash
+# Usage: curl -fsSL https://raw.githubusercontent.com/arodriguezcb/claude-insights/main/install.sh | bash
 #
 # After this, open Claude Code in any folder and run:  /ai-fluency
 
-REPO="Feloguarin/claude-insight"
+REPO="arodriguezcb/claude-insights"
 SKILL_DIR="${HOME}/.claude/skills/ai-fluency"
 WORKFLOW_DIR="${HOME}/.claude/workflows"
 
@@ -27,11 +27,11 @@ REF="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/
 if [ -n "$REF" ]; then
   echo "📦 Latest release: ${REF}"
   URL="https://github.com/${REPO}/archive/refs/tags/${REF}.tar.gz"
-  DIRNAME="claude-insight-${REF#v}"
+  DIRNAME="${REPO##*/}-${REF#v}"
 else
   echo "ℹ️  No tagged release found — falling back to main."
   URL="https://github.com/${REPO}/archive/refs/heads/main.tar.gz"
-  DIRNAME="claude-insight-main"
+  DIRNAME="${REPO##*/}-main"
 fi
 
 # Download the repo into a temp dir (tarball — no git or pip needed).
