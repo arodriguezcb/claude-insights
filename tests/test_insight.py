@@ -6,6 +6,7 @@ rate-based scoring that can't be inflated by volume, gap-capped active time,
 and confidence shrinkage of thin signals. Pure stdlib unittest.
 """
 import contextlib
+import datetime
 import glob
 import io
 import json
@@ -1285,6 +1286,116 @@ class TestFullCatalogAdoption(unittest.TestCase):
         self.assertIn("superpowers", a)
         self.assertFalse(a["superpowers"]["installed"])
         self.assertIsNone(a["superpowers"]["enabled"])
+
+
+class TestMetaLine(unittest.TestCase):
+    """The header meta line surfaces evaluated date + CC version + (guarded) activity window."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def _render(self, recs, generated_at, cc_version=None, null_window=False):
+        write_session(self.tmp, "s.jsonl", recs)
+        corpus = insight.parse(insight.discover_files(self.tmp))
+        if cc_version is not None:
+            corpus.cc_version = cc_version
+        if null_window:
+            corpus.first_ts = None
+            corpus.last_ts = None
+        result = insight.analyze(corpus)
+        cards, strength = insight.build_action_plan(corpus, result)
+        return insight.build_html(corpus, result, cards, strength, generated_at=generated_at)
+
+    def test_meta_line_renders_date_version_window(self):
+        gen = datetime.datetime(2026, 6, 21, 9, 30)
+        html = self._render(
+            [user_text("add a /health endpoint to server.py", ts="2026-01-01T00:00:00Z"),
+             user_text("run it", ts="2026-01-08T00:00:00Z")],
+            generated_at=gen, cc_version="2.1.185")
+        self.assertIn("Evaluated 2026-06-21", html)
+        self.assertIn("Claude Code v2.1.185", html)
+        # activity-window range with both endpoints present
+        self.assertIn("activity 2026-01-01", html)
+        self.assertIn("2026-01-08", html)
+
+    def test_meta_line_without_timestamps_omits_window(self):
+        # A corpus with no first/last ts must still render date + version, and NOT crash on a
+        # None date or print the activity-window segment.
+        gen = datetime.datetime(2026, 6, 21)
+        html = self._render([user_text("hi")], generated_at=gen, cc_version="2.0.0",
+                            null_window=True)
+        # the meta line itself is exactly date + version, with no activity-window segment
+        self.assertIn('<p class="meta">Evaluated 2026-06-21 · Claude Code v2.0.0</p>', html)
+        # the activity-window segment (` · activity <date> → <date>`) never rendered
+        self.assertNotIn("· activity", html)
+
+    def test_meta_line_unknown_version_renders_dash(self):
+        gen = datetime.datetime(2026, 6, 21)
+        html = self._render([user_text("hi")], generated_at=gen, cc_version=None)
+        self.assertIn("Claude Code v—", html)
+
+
+class TestTwoSectionAdoption(unittest.TestCase):
+    """_usage_section_html renders both 'suggested plugins' and 'marketplace' sub-sections,
+    with not-installed / superpowers / outdated markers."""
+
+    def _usage(self):
+        from collections import Counter
+        return {"mcp_servers": Counter({"engram": 3}), "commands": Counter(), "work_types": {}}
+
+    def test_two_sub_sections_with_status_and_outdated(self):
+        adoption = {
+            # named-tool (suggested) targets
+            "engram": {"installed": True, "enabled": True, "used": 3,
+                       "installed_version": "0.1.0", "latest_version": "0.1.1", "outdated": True},
+            "superpowers": {"installed": False, "enabled": None, "used": 0,
+                            "installed_version": None, "latest_version": None, "outdated": None},
+            # marketplace catalog
+            "crabi/ai-marketplace": {
+                "installed": True, "enabled": True, "used": 2,
+                "plugin_breakdown": [
+                    {"name": "sre", "installed": True, "used": 2,
+                     "installed_version": "0.1.0", "latest_version": "0.1.0", "outdated": False},
+                    {"name": "infra", "installed": False, "used": 0,
+                     "installed_version": None, "latest_version": "0.2.0", "outdated": None},
+                    {"name": "qa", "installed": True, "used": 0,
+                     "installed_version": "0.1.0", "latest_version": "0.2.0", "outdated": True},
+                ],
+            },
+        }
+        html = insight._usage_section_html(self._usage(), adoption, span_days=30)
+
+        # Both sub-section headings
+        self.assertIn("Crabi suggested plugins", html)
+        self.assertIn("Crabi AI marketplace", html)
+        # superpowers appears as not-installed
+        self.assertIn("Engram (memory)", html)  # friendly label for the suggested tool
+        self.assertIn("not installed", html)
+        # a not-installed catalog plugin shows the not-installed label
+        self.assertIn("infra", html)
+        # outdated marker on the outdated suggested tool + outdated catalog plugin
+        self.assertIn("update available", html)
+        self.assertIn("v0.1.0 → v0.1.1", html)  # engram, suggested
+        self.assertIn("v0.1.0 → v0.2.0", html)  # qa, marketplace
+        # a current (outdated=False) plugin makes NO version claim
+        self.assertNotIn("v0.1.0 → v0.1.0", html)
+        # marketplace status labels
+        self.assertIn("installed · used", html)
+        self.assertIn("installed · idle", html)
+
+    def test_outdated_none_renders_no_version_claim(self):
+        adoption = {
+            "crabi/ai-marketplace": {
+                "installed": True, "enabled": True, "used": 0,
+                "plugin_breakdown": [
+                    {"name": "data", "installed": True, "used": 1,
+                     "installed_version": "unknown", "latest_version": "0.3.0", "outdated": None},
+                ],
+            },
+        }
+        html = insight._usage_section_html(self._usage(), adoption, span_days=30)
+        self.assertIn("data", html)
+        self.assertNotIn("update available", html)
 
 
 if __name__ == "__main__":

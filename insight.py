@@ -1483,6 +1483,18 @@ _ADOPTION_LABEL = {
 }
 
 
+def _outdated_badge(state):
+    """An 'update available · vX → vY' badge when `state["outdated"]` is True; '' otherwise.
+
+    Renders no version claim when outdated is None (unknown) or False (current) — the report
+    never asserts up-to-date / outdated unless the versions actually compared as behind."""
+    if not isinstance(state, dict) or state.get("outdated") is not True:
+        return ""
+    iv = state.get("installed_version") or "?"
+    lv = state.get("latest_version") or "?"
+    return f'<span class="tag w">update available · v{_esc(iv)} → v{_esc(lv)}</span>'
+
+
 def _usage_section_html(usage, adoption, span_days):
     """One combined 'Usage & Adoption' section, mirroring _analysis_section_html.
 
@@ -1535,10 +1547,13 @@ def _usage_section_html(usage, adoption, span_days):
                      f'<div class="bv">{p:.0f}%</div></div>')
         parts.append(f'<p class="def" style="margin-top:14px">Work-type mix {_esc(span)}:</p>{bars}')
 
-    # --- Adoption -------------------------------------------------------------------
+    # --- Adoption: two sub-sections --------------------------------------------------
     if adoption:
-        parts.append('<p class="def" style="margin-top:14px">Crabi-tool adoption:</p>')
-        for target, state in adoption.items():
+        # (1) Crabi suggested plugins — the named-tool targets as aggregate badge rows.
+        parts.append('<p class="def" style="margin-top:18px">'
+                     '<b>Crabi suggested plugins</b> — the tools we recommend leaning on:</p>')
+        for target in SIGNATURES:
+            state = adoption.get(target)
             if not isinstance(state, dict):
                 continue
             label = _ADOPTION_LABEL.get(target, target)
@@ -1556,31 +1571,45 @@ def _usage_section_html(usage, adoption, span_days):
             # The coaching signal: installed but never invoked.
             if installed and not used:
                 badges.append('<span class="tag w">never used</span>')
-            else:
+            elif used:
                 badges.append(f'<span class="tag ld">used {used:,}×</span>')
+            badges.append(_outdated_badge(state))
             unused = installed and not used
             row_cls = ' style="border-left:4px solid var(--warn)"' if unused else ""
-            # Per-plugin breakdown for the marketplace target: which plugins are used vs idle.
-            bd = state.get("plugin_breakdown") or []
-            bd_html = ""
-            if bd:
-                used_p = sorted((p for p in bd if p.get("used")), key=lambda x: -x["used"])
-                idle_p = [p for p in bd if not p.get("used")]
-                if used_p:
-                    chips = " ".join(f'<span class="tag s">{_esc(p["name"])} {p["used"]:,}×</span>'
-                                     for p in used_p)
-                    bd_html += f'<p class="rate">Used: {chips}</p>'
-                if idle_p:
-                    chips = " ".join(f'<span class="tag w">{_esc(p["name"])}</span>' for p in idle_p)
-                    bd_html += (f'<p class="rate">Never used ({len(idle_p)} of {len(bd)}): '
-                                f'{chips} — installed but idle.</p>')
             parts.append(
                 f'<div class="dim"{row_cls}><div class="top">'
-                f'<span class="name">{_esc(label)} {"".join(badges)}</span></div>'
+                f'<span class="name">{_esc(label)} {"".join(b for b in badges if b)}</span></div>'
                 + ('<p class="rate">Installed but never used — a tool you could lean on.</p>'
-                   if unused else "")
-                + bd_html
+                   if unused else
+                   ('<p class="rate">Not installed — install it to unlock this workflow.</p>'
+                    if not installed else ""))
                 + '</div>')
+
+        # (2) Crabi AI marketplace — every catalog plugin, status + outdated marker.
+        crabi = adoption.get(CRABI_REPO)
+        bd = (crabi.get("plugin_breakdown") if isinstance(crabi, dict) else None) or []
+        if bd:
+            parts.append('<p class="def" style="margin-top:18px">'
+                         '<b>Crabi AI marketplace</b> — every plugin in the catalog:</p>')
+            for p in sorted(bd, key=lambda x: (not x.get("installed"), -x.get("used", 0), x["name"])):
+                p_installed = p.get("installed")
+                p_used = p.get("used", 0)
+                if not p_installed:
+                    status = '<span class="tag ld">not installed</span>'
+                    note = "not installed"
+                elif p_used:
+                    status = f'<span class="tag s">installed · used {p_used:,}×</span>'
+                    note = ""
+                else:
+                    status = '<span class="tag w">installed · idle</span>'
+                    note = "installed but idle"
+                out_badge = _outdated_badge(p)
+                row_cls = ' style="border-left:4px solid var(--warn)"' if (p_installed and not p_used) else ""
+                parts.append(
+                    f'<div class="dim"{row_cls}><div class="top">'
+                    f'<span class="name">{_esc(p["name"])} {status}{out_badge}</span></div>'
+                    + (f'<p class="rate">{_esc(note)}</p>' if note else "")
+                    + '</div>')
 
     parts.append('<p style="color:var(--mut);font-size:13px;margin-top:10px">'
                  'Raw counts over your real measured window — not normalized. Adoption is read '
@@ -1904,6 +1933,15 @@ def build_html(corpus, result, cards, strength, archive_info=None, analysis=None
         arch_hedge = ('<p style="margin-top:8px;font-size:12.5px;color:var(--warn)">Provisional — based on only '
                       f'{len(corpus.real_prompts)} prompt(s); the archetype can shift as more history accumulates.</p>')
 
+    # Header provenance meta line: evaluated date + CC version always render; the activity
+    # window is guarded so a timestamp-less corpus never formats a None date (Desired-End-State #4).
+    meta_bits = [f"Evaluated {generated_at:%Y-%m-%d}",
+                 f"Claude Code v{_esc(corpus.cc_version) if corpus.cc_version else '—'}"]
+    if corpus.first_ts and corpus.last_ts:
+        meta_bits.append(
+            f"activity {corpus.first_ts:%Y-%m-%d} → {corpus.last_ts:%Y-%m-%d} ({days} days)")
+    meta_line = '<p class="meta">' + " · ".join(meta_bits) + "</p>"
+
     # fun facts
     facts = [
         f"{len(corpus.real_prompts)} prompts you actually typed (out of {corpus.user_records:,} user records — the rest were tool output, subagent turns or system text)",
@@ -1944,6 +1982,7 @@ header{{text-align:center;padding:60px 0 12px}}
 .kick{{letter-spacing:.22em;text-transform:uppercase;font-size:12px;color:var(--mut)}}
 h1{{font-size:34px;margin:10px 0 4px}}
 .sub{{color:var(--mut);max-width:620px;margin:6px auto 0;font-size:15px}}
+.meta{{color:var(--mut);font-size:12.5px;margin:14px auto 0;letter-spacing:.02em}}
 .hero{{margin:30px auto 0;display:flex;gap:22px;align-items:stretch;flex-wrap:wrap;justify-content:center}}
 .score-card{{background:linear-gradient(135deg,var(--p2),var(--p));border:1px solid var(--line);border-radius:22px;
 padding:26px 30px;text-align:center;min-width:240px;box-shadow:0 18px 50px rgba(0,0,0,.4)}}
@@ -2053,30 +2092,15 @@ code{{background:#23264a;padding:1px 6px;border-radius:5px;font-size:13px}}
   </div>
 </div>
 
+<!-- ===== Group 1 · The verdict — "How did I do?" ===== -->
+<div class="band-meaning" style="margin-top:22px"><b>{_esc(result['band'])} ({result['overall']}/100).</b> {_esc(result['band_meaning'])}</div>
+{meta_line}
+
+<!-- ===== Group 2 · The breakdown — "Why?" ===== -->
 <section>
   <h3>Professional assessment</h3>
   {assessment_html}
 </section>
-
-<section>
-  <h3>What your score means</h3>
-  <div class="band-meaning"><b>{_esc(result['band'])} ({result['overall']}/100).</b> {_esc(result['band_meaning'])}</div>
-</section>
-
-<section>
-  <h3>How much data this is based on</h3>
-  <div class="ingest">
-    <div class="ing"><div class="n">{corpus.files}</div><div class="l">sessions scanned</div></div>
-    <div class="ing"><div class="n">{len(corpus.projects)}</div><div class="l">projects</div></div>
-    <div class="ing"><div class="n">{corpus.total_bytes/1e6:.1f} MB</div><div class="l">transcript data parsed</div></div>
-    <div class="ing"><div class="n">{days} days</div><div class="l">span of activity</div></div>
-    <div class="ing"><div class="n">{len(corpus.real_prompts)}</div><div class="l">real prompts you typed</div></div>
-    <div class="ing"><div class="n">{active_h:.0f} h</div><div class="l">hands-on active time</div></div>
-    {archive_tile}
-  </div>
-</section>
-
-{usage_section}
 
 {analysis_section}
 {analysis_status_html}
@@ -2086,29 +2110,49 @@ code{{background:#23264a;padding:1px 6px;border-radius:5px;font-size:13px}}
   {dim_html}
 </section>
 
+<!-- ===== Group 3 · Strengths & standing — "Where do I stand?" ===== -->
+<section>
+  <h3>Where you stand</h3>
+  {strength_html}
+  {skill_html}
+  <details>
+    <summary>Archetype affinity — how close you are to each builder style</summary>
+    {aff}
+  </details>
+</section>
+
+<!-- ===== Group 4 · What to do next — "What now?" ===== -->
 <section>
   <h3>What to improve — and exactly how</h3>
   {improve_intro}
   {improve_cards}
-  {strength_html}
 </section>
 
-<section>
-  <h3>Your skill map</h3>
-  {skill_html}
-</section>
+<!-- ===== Group 5 · Trust & method — "Can I believe it?" ===== -->
+<details>
+  <summary>Trust &amp; method — the data, your tool adoption, and the honest numbers</summary>
+  <section>
+    <h3>How much data this is based on</h3>
+    <div class="ingest">
+      <div class="ing"><div class="n">{corpus.files}</div><div class="l">sessions scanned</div></div>
+      <div class="ing"><div class="n">{len(corpus.projects)}</div><div class="l">projects</div></div>
+      <div class="ing"><div class="n">{corpus.total_bytes/1e6:.1f} MB</div><div class="l">transcript data parsed</div></div>
+      <div class="ing"><div class="n">{days} days</div><div class="l">span of activity</div></div>
+      <div class="ing"><div class="n">{len(corpus.real_prompts)}</div><div class="l">real prompts you typed</div></div>
+      <div class="ing"><div class="n">{active_h:.0f} h</div><div class="l">hands-on active time</div></div>
+      {archive_tile}
+    </div>
+  </section>
 
-<section>
-  <h3>Archetype affinity</h3>
-  {aff}
-</section>
+  {usage_section}
 
-<section>
-  <h3>Honest numbers at a glance</h3>
-  <ul class="facts">{facts_html}</ul>
-</section>
+  <section>
+    <h3>Honest numbers at a glance</h3>
+    <ul class="facts">{facts_html}</ul>
+  </section>
+</details>
 
-<footer>Generated locally by Claude Insight v2 · your transcripts never left this machine.</footer>
+<footer>Generated locally by Claude Insight v2 · evaluated {generated_at:%Y-%m-%d} · Claude Code v{_esc(corpus.cc_version) if corpus.cc_version else '—'} · your transcripts never left this machine.</footer>
 </div></body></html>"""
 
 
