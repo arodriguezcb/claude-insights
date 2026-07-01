@@ -38,7 +38,7 @@ provenance meta line near the top records **when it was evaluated**, the **activ
 - **A 4-competency skill map** — **Delegation · Description · Discernment · Diligence** (the AI Fluency framework) — each placed on a 1–5 level with one concrete next move.
 - **Five measured dimensions** behind the map — Briefing, Verification, Context-setting, Iteration, Toolcraft — each a defensible rate, not a vanity count.
 - **What / Where / How** — your top growth levers, each tied to real moments in your transcripts and (when you run the full skill) a rewrite of one of *your own* prompts.
-- **Usage & Crabi-tool adoption** — how your tool time splits across work types (Build · Debug · Plan · Investigate · Shell/Ops · Delegate · Other), your most-used MCP servers and slash commands, and a **two-section plugin adoption** view: *Crabi suggested plugins* (engram, obsidian, ponytail, desplega, superpowers) and the *Crabi AI marketplace* (every catalog plugin) — each tagged not-installed / installed-idle / installed-used, with an **outdated** marker when your installed version trails the latest in your local marketplace clone.
+- **Usage & Crabi-tool adoption** — how your tool time splits across work types (Build · Debug · Plan · Investigate · Shell/Ops · Delegate · Other), your most-used MCP servers and slash commands, and a **two-section plugin adoption** view: *Crabi suggested plugins* (engram, obsidian, ponytail, desplega, superpowers, context7) and the *Crabi AI marketplace* (every catalog plugin) — each tagged not-installed / installed-idle / installed-used, with an **outdated** marker when your installed version trails the latest in your local marketplace clone.
 - **Honest data accounting** — how many real prompts you typed, projects, MB, and hands-on time — across **more than the 30 days Claude Code keeps on disk** (see below).
 
 ## 🎯 How the score works (and what it won't do)
@@ -220,9 +220,11 @@ changes the scoring):
 - **Crabi plugin adoption** — two sub-sections, read live and offline from your local
   plugin config (nothing leaves your machine):
   - **Crabi suggested plugins** — the tools we recommend leaning on (engram, obsidian,
-    ponytail, desplega, superpowers) as aggregate rows: installed / enabled / used, flagging
-    any that are installed but never reached for (and superpowers as not-installed until you
-    add it).
+    ponytail, desplega, superpowers, context7) as aggregate rows: installed / enabled / used,
+    flagging any that are installed but never reached for (and superpowers as not-installed
+    until you add it). Context7 is tracked as an MCP server rather than a plugin: *installed*
+    reads your `~/.claude.json` / project MCP config, *used* counts both direct and claude.ai
+    connector calls, and it carries no version tracking.
   - **Crabi AI marketplace** — *every* plugin in the catalog (not just the ones you have),
     each tagged **not installed** / **installed · idle** / **installed · used N×**, with
     usage counted across slash-command, MCP, and sub-agent channels.

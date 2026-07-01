@@ -496,6 +496,7 @@ SERVER_DISPLAY = {
     "jaeger-prod": ("Jaeger (Prod)", "Tracing"),
     "jaeger-qa": ("Jaeger (QA)", "Tracing"),
     "context7": ("Context7", "Docs"),
+    "claude_ai_Context7": ("Context7 (claude.ai)", "Docs"),
     "github": ("GitHub", "VCS"),
 }
 
@@ -1545,6 +1546,7 @@ _ADOPTION_LABEL = {
     "ponytail": "Ponytail (code-quality)",
     "obsidian": "Obsidian (notes)",
     "desplega": "Desplega (toolbox)",
+    "context7": "Context7",
 }
 
 

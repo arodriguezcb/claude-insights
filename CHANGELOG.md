@@ -7,6 +7,7 @@ project aims for [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Adoption: track Context7 (MCP server) as a Crabi-suggested tool.
 - **Report provenance fields** — the report now records, on a meta line under the title
   and in the footer, the **evaluated date**, the **activity window** (`first → last
   (N days)`), and the **Claude Code version** (read off the latest transcript event that
