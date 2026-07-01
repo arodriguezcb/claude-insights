@@ -404,12 +404,46 @@ def _load_enabled_plugins(claude_dir=None):
     return enabled if isinstance(enabled, dict) else {}
 
 
+def _load_mcp_server_names(claude_json=None):
+    """set[str] of configured MCP server NAMES from ~/.claude.json (param overridable).
+
+    Union of: top-level `mcpServers` keys, each `projects[<path>].mcpServers` keys, and a
+    best-effort `<path>/.mcp.json` -> `mcpServers` keys per project path. Never raises;
+    returns set() on any miss.
+
+    SECRET SAFETY: reads KEY NAMES ONLY, never entry values — mcpServers entries carry env
+    vars / headers that can hold tokens; none of that may reach the corpus/report/evidence.
+    """
+    path = os.path.expanduser(claude_json or "~/.claude.json")
+    raw = _read_json(path)
+    names = set()
+
+    def _keys(section):
+        return set(section) if isinstance(section, dict) else set()
+
+    names |= _keys(raw.get("mcpServers"))
+    projects = raw.get("projects")
+    if isinstance(projects, dict):
+        for proj_path, proj in projects.items():
+            if isinstance(proj, dict):
+                names |= _keys(proj.get("mcpServers"))
+            # best-effort per-project .mcp.json (keys only)
+            names |= _keys(_read_json(os.path.join(proj_path, ".mcp.json")).get("mcpServers"))
+    return names
+
+
 # Tiny signature map — NON-PLUGIN / DISPLAY ONLY (Finding 4). Plugin provenance is read
 # live from config, so the crabi/ai-marketplace target needs NO entry here. Each named
 # target's USED rules are the only thing that can rot, so keep this small.
+#   * plugin_id       — OPTIONAL. Present for plugin-backed targets (installed/enabled/version
+#                       come from the plugin config join). Absent for MCP-server targets.
 #   * mcp_tool_regex  — engram's tools land in tool_usage as bare mem_* (Finding 5).
 #   * namespace       — skills/commands surface as "<ns>:<name>" and "/<ns>:<name>"; a single
 #                       namespace token covers ponytail / obsidian / desplega usage.
+#   * mcp_server_key  — an MCP-server target is INSTALLED iff this name is in the configured
+#                       MCP servers (~/.claude.json). No plugin_id, no version/enabled signal.
+#   * mcp_server_regex — an MCP-server target's USED count sums corpus.mcp_servers ids matching
+#                       this regex (direct server + claude.ai connector share one target).
 # No hook-banner parsing (Decision: speculative without Superpowers installed — Appendix).
 SIGNATURES = {
     "engram": {
@@ -441,6 +475,12 @@ SIGNATURES = {
         "plugin_id": "superpowers@superpowers",
         "namespace": "superpowers",
     },
+    "context7": {
+        # MCP-server target (no plugin_id): installed = configured in ~/.claude.json; used =
+        # direct server id `context7` + claude.ai connector id `claude_ai_Context7`.
+        "mcp_server_key": "context7",
+        "mcp_server_regex": re.compile(r"(?i)^(claude_ai_)?context7$"),
+    },
 }
 
 # The provenance key: a plugin is "Crabi-authored" iff its marketplace resolves to this repo.
@@ -456,6 +496,7 @@ SERVER_DISPLAY = {
     "jaeger-prod": ("Jaeger (Prod)", "Tracing"),
     "jaeger-qa": ("Jaeger (QA)", "Tracing"),
     "context7": ("Context7", "Docs"),
+    "claude_ai_Context7": ("Context7 (claude.ai)", "Docs"),
     "github": ("GitHub", "VCS"),
 }
 
@@ -582,7 +623,7 @@ def _load_marketplace_catalog(marketplace=None, repo_slug=None, claude_dir=None)
     return out
 
 
-def build_adoption(corpus, claude_dir=None):
+def build_adoption(corpus, claude_dir=None, claude_json=None):
     """Per-target {installed, enabled, used} from the offline provenance join + signatures.
 
     Targets:
@@ -592,12 +633,16 @@ def build_adoption(corpus, claude_dir=None):
         no signature needed (Finding 4).
       * named tools (engram / ponytail / obsidian / desplega) — installed iff their plugin_id
         is in installed_plugins; used per their signature rules.
+      * MCP-server targets (context7) — no plugin_id; installed iff the server name is in
+        ~/.claude.json (claude_json param overridable for tests); enabled + version fields
+        stay None; used sums corpus.mcp_servers ids matching the target's mcp_server_regex.
 
     Pure post-parse + config read; raises on nothing (config readers return {} on failure).
     """
     installed = _load_installed_plugins(claude_dir)
     marketplaces = _load_known_marketplaces(claude_dir)
     enabled = _load_enabled_plugins(claude_dir)
+    mcp_server_names = _load_mcp_server_names(claude_json)   # loaded once, not per target
 
     out = {}
 
@@ -644,9 +689,9 @@ def build_adoption(corpus, claude_dir=None):
 
     # --- named tools via signature map ------------------------------------------------
     for target, sig in SIGNATURES.items():
-        pid = sig["plugin_id"]
-        is_installed = pid in installed
+        pid = sig.get("plugin_id")   # optional — absent for MCP-server targets
         used = 0
+
         rx = sig.get("mcp_tool_regex")
         if rx is not None:
             for tool, count in corpus.tool_usage.items():
@@ -658,21 +703,42 @@ def build_adoption(corpus, claude_dir=None):
         cmd_rx = sig.get("cmd_regex")
         if cmd_rx is not None:
             used += _cmd_used(corpus, cmd_rx)
-        # Per-tool version + outdated marker. installed_version comes off the install record;
-        # latest comes from the tool's marketplace clone, resolved by NAME (a suggested tool
-        # only knows its marketplace name — the plugin_id suffix — not a repo slug).
-        installed_version = installed[pid].get("version") if is_installed else None
-        mkt_name = pid.rsplit("@", 1)[1] if "@" in pid else None
-        latest_version = _load_marketplace_catalog(
-            marketplace=mkt_name, claude_dir=claude_dir).get(target) if mkt_name else None
-        out[target] = {
-            "installed": is_installed,
-            "enabled": (bool(enabled.get(pid)) if is_installed else None),
-            "used": used,
-            "installed_version": installed_version,
-            "latest_version": latest_version,
-            "outdated": _version_outdated(installed_version, latest_version),
-        }
+        # MCP-server USED: sum corpus.mcp_servers ids matching the regex (direct + connector).
+        srv_rx = sig.get("mcp_server_regex")
+        if srv_rx is not None:
+            for sid, count in corpus.mcp_servers.items():
+                if srv_rx.match(sid):
+                    used += count
+
+        if pid is not None:
+            # Plugin-backed: installed/enabled/version from the config join.
+            is_installed = pid in installed
+            # Per-tool version + outdated marker. installed_version comes off the install
+            # record; latest comes from the tool's marketplace clone, resolved by NAME (a
+            # suggested tool only knows its marketplace name — the plugin_id suffix).
+            installed_version = installed[pid].get("version") if is_installed else None
+            mkt_name = pid.rsplit("@", 1)[1] if "@" in pid else None
+            latest_version = _load_marketplace_catalog(
+                marketplace=mkt_name, claude_dir=claude_dir).get(target) if mkt_name else None
+            out[target] = {
+                "installed": is_installed,
+                "enabled": (bool(enabled.get(pid)) if is_installed else None),
+                "used": used,
+                "installed_version": installed_version,
+                "latest_version": latest_version,
+                "outdated": _version_outdated(installed_version, latest_version),
+            }
+        else:
+            # MCP-server target: installed from ~/.claude.json; no enabled/version signal.
+            srv_key = sig.get("mcp_server_key")
+            out[target] = {
+                "installed": srv_key in mcp_server_names,
+                "enabled": None,
+                "used": used,
+                "installed_version": None,
+                "latest_version": None,
+                "outdated": None,
+            }
 
     return out
 
@@ -1480,6 +1546,7 @@ _ADOPTION_LABEL = {
     "ponytail": "Ponytail (code-quality)",
     "obsidian": "Obsidian (notes)",
     "desplega": "Desplega (toolbox)",
+    "context7": "Context7",
 }
 
 
