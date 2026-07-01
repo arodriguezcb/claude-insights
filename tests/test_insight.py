@@ -863,6 +863,9 @@ class TestAdoption(unittest.TestCase):
     def setUp(self):
         self.cfg = tempfile.mkdtemp()   # fake ~/.claude
         self.tmp = tempfile.mkdtemp()   # transcript dir
+        # Hermetic: point the MCP-server loader at a file inside the tmpdir so context7's
+        # `installed` never reads the real host ~/.claude.json (host-dependent / flaky).
+        self.claude_json = os.path.join(self.cfg, "claude.json")
 
     def _corpus(self, recs):
         write_session(self.tmp, "s.jsonl", recs)
@@ -885,7 +888,7 @@ class TestAdoption(unittest.TestCase):
             assistant_tool("mcp__plugin_engram_engram__mem_search"),
             user_text("<command-name>/ponytail:ponytail-review</command-name>"),
         ])
-        a = insight.build_adoption(corpus, claude_dir=self.cfg)
+        a = insight.build_adoption(corpus, claude_dir=self.cfg, claude_json=self.claude_json)
 
         # installed + enabled + used
         self.assertTrue(a["engram"]["installed"])
@@ -917,7 +920,7 @@ class TestAdoption(unittest.TestCase):
             assistant_tool("Bash", command='cd "/Users/x/Obsidian Vault" && obsidian vault="Obsidian Vault" search query="z"'),
             assistant_tool("Bash", command='cd "/Users/x/Obsidian Vault" && git commit -m "note"'),  # not the CLI
         ])
-        a = insight.build_adoption(corpus, claude_dir=self.cfg)
+        a = insight.build_adoption(corpus, claude_dir=self.cfg, claude_json=self.claude_json)
         self.assertTrue(a["obsidian"]["installed"])
         # Two `obsidian vault=` invocations (one chained after &&) count; the `git commit`
         # whose path contains capital-O "Obsidian Vault" must NOT false-match.
@@ -933,7 +936,7 @@ class TestAdoption(unittest.TestCase):
             enabled={"sre@some-other-marketplace": True},
         )
         corpus = self._corpus([user_text("<command-name>/sre:diagnose-service</command-name>")])
-        a = insight.build_adoption(corpus, claude_dir=self.cfg)
+        a = insight.build_adoption(corpus, claude_dir=self.cfg, claude_json=self.claude_json)
         self.assertFalse(a["crabi/ai-marketplace"]["installed"])
         self.assertIsNone(a["crabi/ai-marketplace"]["enabled"])
         self.assertEqual(a["crabi/ai-marketplace"]["used"], 0)
@@ -954,7 +957,7 @@ class TestAdoption(unittest.TestCase):
             user_text("<command-name>/sre:query-logs</command-name>"),
             user_text("<command-name>/desplega:research</command-name>"),  # not a crabi plugin
         ])
-        a = insight.build_adoption(corpus, claude_dir=self.cfg)
+        a = insight.build_adoption(corpus, claude_dir=self.cfg, claude_json=self.claude_json)
         crabi = a["crabi/ai-marketplace"]
         self.assertTrue(crabi["installed"])
         self.assertTrue(crabi["enabled"])           # at least one crabi plugin enabled
@@ -981,7 +984,7 @@ class TestAdoption(unittest.TestCase):
             assistant_tool("Agent", subagent_type="qa:crabi-qa"),         # qa via subagent
             # docs: never invoked
         ])
-        a = insight.build_adoption(corpus, claude_dir=self.cfg)
+        a = insight.build_adoption(corpus, claude_dir=self.cfg, claude_json=self.claude_json)
         bd = {p["name"]: p["used"] for p in a["crabi/ai-marketplace"]["plugin_breakdown"]}
         self.assertEqual(bd["sre"], 1)    # slash channel
         self.assertEqual(bd["data"], 2)   # MCP channel — would read 0 under namespace-only
@@ -995,7 +998,8 @@ class TestAdoption(unittest.TestCase):
         self.assertEqual(insight._load_installed_plugins(empty), {})
         self.assertEqual(insight._load_known_marketplaces(empty), {})
         self.assertEqual(insight._load_enabled_plugins(empty), {})
-        a = insight.build_adoption(insight.Corpus(), claude_dir=empty)
+        a = insight.build_adoption(insight.Corpus(), claude_dir=empty,
+                                   claude_json=os.path.join(empty, "claude.json"))
         # crabi target degrades gracefully: not installed, enabled None, zero used.
         self.assertFalse(a["crabi/ai-marketplace"]["installed"])
         self.assertIsNone(a["crabi/ai-marketplace"]["enabled"])
@@ -1018,8 +1022,91 @@ class TestAdoption(unittest.TestCase):
         self.assertEqual(insight._load_known_marketplaces(self.cfg), {})
         self.assertEqual(insight._load_enabled_plugins(self.cfg), {})
         # And the full builder still produces a well-formed (all-negative) result.
-        a = insight.build_adoption(insight.Corpus(), claude_dir=self.cfg)
+        a = insight.build_adoption(insight.Corpus(), claude_dir=self.cfg,
+                                   claude_json=self.claude_json)
         self.assertFalse(a["crabi/ai-marketplace"]["installed"])
+
+    # --- context7 (MCP-server target) ------------------------------------------------
+    def _write_claude_json(self, obj):
+        """Write a fake ~/.claude.json at self.claude_json."""
+        with open(self.claude_json, "w", encoding="utf-8") as f:
+            json.dump(obj, f)
+
+    def test_context7_installed_via_top_level_mcp_servers(self):
+        # SECRET SAFETY: the entry value carries a token; only the KEY name may be read.
+        self._write_claude_json(
+            {"mcpServers": {"context7": {"url": "https://x", "headers": {"Authorization": "SECRET"}}}})
+        a = insight.build_adoption(self._corpus([user_text("hi")]),
+                                   claude_dir=self.cfg, claude_json=self.claude_json)
+        self.assertTrue(a["context7"]["installed"])
+
+    def test_context7_installed_via_project_mcp_servers_only(self):
+        self._write_claude_json(
+            {"projects": {"/some/proj": {"mcpServers": {"context7": {"command": "npx"}}}}})
+        a = insight.build_adoption(self._corpus([user_text("hi")]),
+                                   claude_dir=self.cfg, claude_json=self.claude_json)
+        self.assertTrue(a["context7"]["installed"])
+
+    def test_context7_installed_via_project_mcp_json_only(self):
+        # A project's own .mcp.json declares context7; nothing in ~/.claude.json's mcpServers.
+        proj = tempfile.mkdtemp()
+        with open(os.path.join(proj, ".mcp.json"), "w", encoding="utf-8") as f:
+            json.dump({"mcpServers": {"context7": {"command": "npx"}}}, f)
+        self._write_claude_json({"projects": {proj: {}}})
+        a = insight.build_adoption(self._corpus([user_text("hi")]),
+                                   claude_dir=self.cfg, claude_json=self.claude_json)
+        self.assertTrue(a["context7"]["installed"])
+
+    def test_context7_not_installed_when_absent(self):
+        # No .claude.json at all -> loader returns set() -> not installed, enabled None.
+        a = insight.build_adoption(self._corpus([user_text("hi")]),
+                                   claude_dir=self.cfg, claude_json=self.claude_json)
+        self.assertFalse(a["context7"]["installed"])
+        self.assertIsNone(a["context7"]["enabled"])
+        # And a config that exists but has no context7 key is likewise not installed.
+        self._write_claude_json({"mcpServers": {"some-other-server": {"command": "x"}}})
+        a2 = insight.build_adoption(self._corpus([user_text("hi")]),
+                                    claude_dir=self.cfg, claude_json=self.claude_json)
+        self.assertFalse(a2["context7"]["installed"])
+        self.assertIsNone(a2["context7"]["enabled"])
+
+    def test_context7_used_counts_direct_and_connector(self):
+        # Both the direct MCP server (context7) and the claude.ai connector
+        # (claude_ai_Context7) count toward used; a non-context7 server does NOT.
+        corpus = self._corpus([
+            assistant_tool("mcp__context7__query-docs"),
+            assistant_tool("mcp__claude_ai_Context7__query-docs"),
+            assistant_tool("mcp__grafana-qa__query_prometheus"),  # unrelated server — no count
+        ])
+        a = insight.build_adoption(corpus, claude_dir=self.cfg, claude_json=self.claude_json)
+        self.assertEqual(a["context7"]["used"], 2)
+
+    def test_context7_version_fields_all_none(self):
+        self._write_claude_json({"mcpServers": {"context7": {"command": "npx"}}})
+        a = insight.build_adoption(self._corpus([user_text("hi")]),
+                                   claude_dir=self.cfg, claude_json=self.claude_json)
+        c7 = a["context7"]
+        self.assertIsNone(c7["installed_version"])
+        self.assertIsNone(c7["latest_version"])
+        self.assertIsNone(c7["outdated"])
+        self.assertIsNone(c7["enabled"])
+
+    def test_plugin_targets_unaffected_by_mcp_refactor(self):
+        # Regression for the sig.get("plugin_id") refactor: plugin-backed targets still
+        # resolve installed/enabled/used exactly as before.
+        _write_claude_config(
+            self.cfg,
+            installed=["engram@engram"],
+            marketplaces={"engram": "Gentleman-Programming/engram"},
+            enabled={"engram@engram": True},
+        )
+        corpus = self._corpus([
+            assistant_tool("mcp__plugin_engram_engram__mem_save"),
+        ])
+        a = insight.build_adoption(corpus, claude_dir=self.cfg, claude_json=self.claude_json)
+        self.assertTrue(a["engram"]["installed"])
+        self.assertTrue(a["engram"]["enabled"])
+        self.assertEqual(a["engram"]["used"], 1)
 
 
 class TestUsageSectionHtml(unittest.TestCase):
@@ -1200,7 +1287,8 @@ class TestOutdated(unittest.TestCase):
         )
         write_session(tmp, "s.jsonl", [user_text("hi")])
         corpus = insight.parse(insight.discover_files(tmp))
-        a = insight.build_adoption(corpus, claude_dir=cfg)
+        a = insight.build_adoption(corpus, claude_dir=cfg,
+                                   claude_json=os.path.join(cfg, "claude.json"))
         sre = next(p for p in a["crabi/ai-marketplace"]["plugin_breakdown"] if p["name"] == "sre")
         self.assertEqual(sre["installed_version"], "0.1.0")
         self.assertEqual(sre["latest_version"], "0.1.1")
@@ -1213,6 +1301,7 @@ class TestFullCatalogAdoption(unittest.TestCase):
     def setUp(self):
         self.cfg = tempfile.mkdtemp()
         self.tmp = tempfile.mkdtemp()
+        self.claude_json = os.path.join(self.cfg, "claude.json")  # hermetic MCP-server read
 
     def _corpus(self, recs):
         write_session(self.tmp, "s.jsonl", recs)
@@ -1232,7 +1321,7 @@ class TestFullCatalogAdoption(unittest.TestCase):
             ]},
         )
         corpus = self._corpus([user_text("<command-name>/sre:query-logs</command-name>")])
-        a = insight.build_adoption(corpus, claude_dir=self.cfg)
+        a = insight.build_adoption(corpus, claude_dir=self.cfg, claude_json=self.claude_json)
         bd = {p["name"]: p for p in a["crabi/ai-marketplace"]["plugin_breakdown"]}
         self.assertIn("infra", bd)
         self.assertFalse(bd["infra"]["installed"])
@@ -1254,7 +1343,7 @@ class TestFullCatalogAdoption(unittest.TestCase):
             enabled={"sre@crabi-ai-marketplace": True},
         )
         corpus = self._corpus([user_text("hi")])
-        a = insight.build_adoption(corpus, claude_dir=self.cfg)
+        a = insight.build_adoption(corpus, claude_dir=self.cfg, claude_json=self.claude_json)
         names = sorted(p["name"] for p in a["crabi/ai-marketplace"]["plugin_breakdown"])
         self.assertEqual(names, ["qa", "sre"])  # installed-only, no catalog extras
         for p in a["crabi/ai-marketplace"]["plugin_breakdown"]:
@@ -1273,7 +1362,7 @@ class TestFullCatalogAdoption(unittest.TestCase):
             catalogs={"engram": [{"name": "engram", "version": "0.1.1"}]},
         )
         corpus = self._corpus([user_text("hi")])
-        a = insight.build_adoption(corpus, claude_dir=self.cfg)
+        a = insight.build_adoption(corpus, claude_dir=self.cfg, claude_json=self.claude_json)
         self.assertEqual(a["engram"]["installed_version"], "0.1.0")
         self.assertEqual(a["engram"]["latest_version"], "0.1.1")
         self.assertIs(a["engram"]["outdated"], True)
@@ -1282,7 +1371,7 @@ class TestFullCatalogAdoption(unittest.TestCase):
         # superpowers is a suggested tool but not installed here -> installed False, enabled None.
         self.assertIn("superpowers", insight.SIGNATURES)
         corpus = self._corpus([user_text("hi")])
-        a = insight.build_adoption(corpus, claude_dir=self.cfg)
+        a = insight.build_adoption(corpus, claude_dir=self.cfg, claude_json=self.claude_json)
         self.assertIn("superpowers", a)
         self.assertFalse(a["superpowers"]["installed"])
         self.assertIsNone(a["superpowers"]["enabled"])
